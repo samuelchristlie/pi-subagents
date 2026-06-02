@@ -1103,7 +1103,8 @@ Terse command-style prompts produce shallow, generic work.
 
       const { state: fgState, callbacks: fgCallbacks } = createActivityTracker(effectiveMaxTurns, streamUpdate);
 
-      // Wire session creation to register in widget
+      // Wire session creation to register in widget + start output file streaming
+      let fgOutputCleanup: (() => void) | undefined;
       const origOnSession = fgCallbacks.onSessionCreated;
       fgCallbacks.onSessionCreated = (session: any) => {
         origOnSession(session);
@@ -1112,6 +1113,12 @@ Terse command-style prompts produce shallow, generic work.
             fgId = a.id;
             agentActivity.set(a.id, fgState);
             widget.ensureTimer();
+            // Start streaming transcript to output file (same as background agents)
+            const outputFile = createOutputFilePath(ctx.cwd, a.id, ctx.sessionManager.getSessionId());
+            a.outputFile = outputFile;
+            writeInitialEntry(outputFile, a.id, params.prompt, ctx.cwd);
+            a.outputCleanup = streamToOutputFile(session, outputFile, a.id, ctx.cwd);
+            fgOutputCleanup = a.outputCleanup;
             break;
           }
         }
@@ -1139,8 +1146,11 @@ Terse command-style prompts produce shallow, generic work.
           signal,
           ...fgCallbacks,
         });
+        // Flush final output file entries
+        try { fgOutputCleanup?.(); } catch { /* ignore */ }
       } catch (err) {
         clearInterval(spinnerInterval);
+        try { fgOutputCleanup?.(); } catch { /* ignore */ }
         return textResult(err instanceof Error ? err.message : String(err));
       }
 

@@ -5,9 +5,9 @@
  * matching Claude Code's task output file format.
  */
 
-import { appendFileSync, chmodSync, mkdirSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 
 /**
@@ -24,21 +24,14 @@ export function encodeCwd(cwd: string): string {
 }
 
 /** Create the output file path, ensuring the directory exists.
- *  Mirrors Claude Code's layout: /tmp/{prefix}-{uid}/{encoded-cwd}/{sessionId}/tasks/{agentId}.output */
+ *  Stores subagent transcripts alongside the parent session:
+ *  ~/.pi/agent/sessions/--<encoded-cwd>--/subagents/<sessionId>/<agentId>.jsonl */
 export function createOutputFilePath(cwd: string, agentId: string, sessionId: string): string {
   const encoded = encodeCwd(cwd);
-  const root = join(tmpdir(), `pi-subagents-${process.getuid?.() ?? 0}`);
-  mkdirSync(root, { recursive: true, mode: 0o700 });
-  // chmod is a no-op on Windows and throws on some Windows filesystems.
-  // On Unix we still want to enforce 0o700 past umask, so only swallow on Windows.
-  try {
-    chmodSync(root, 0o700);
-  } catch (err) {
-    if (process.platform !== "win32") throw err;
-  }
-  const dir = join(root, encoded, sessionId, "tasks");
+  const home = process.env.HOME || process.env.USERPROFILE || tmpdir();
+  const dir = join(home, ".pi", "agent", "sessions", `--${encoded}--`, "subagents", sessionId);
   mkdirSync(dir, { recursive: true });
-  return join(dir, `${agentId}.output`);
+  return join(dir, `${agentId}.jsonl`);
 }
 
 /** Write the initial user prompt entry. */
