@@ -5,6 +5,7 @@
  * matching Claude Code's task output file format.
  */
 
+import { createHash } from "node:crypto";
 import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -40,10 +41,18 @@ export interface ToolDefSnapshot {
   description: string;
   parameters: unknown;
   promptGuidelines?: string[];
+  promptSnippet?: string;
+}
+
+/** Compute a stable hash over the system prompt and serialized tool definitions. */
+function computeHash(systemPrompt: string, toolDefs: ToolDefSnapshot[]): string {
+  const payload = JSON.stringify({ systemPrompt, toolDefs });
+  return createHash("sha256").update(payload).digest("hex");
 }
 
 /** Shape of the system_snapshot entry stored in subagent JSONL. */
 export interface SystemSnapshotData {
+  hash: string;
   systemPrompt: string;
   toolDefinitions: ToolDefSnapshot[];
   timestamp: string;
@@ -89,7 +98,7 @@ export function appendSystemSnapshot(
   path: string,
   agentId: string,
   cwd: string,
-  session: { systemPrompt: string; getAllTools(): Array<{ name: string; description: string; parameters: unknown; promptGuidelines?: string[] }> },
+  session: { systemPrompt: string; getAllTools(): Array<{ name: string; description: string; parameters: unknown; promptGuidelines?: string[]; promptSnippet?: string }> },
 ): void {
   const tools = session.getAllTools();
   const toolDefs: ToolDefSnapshot[] = tools.map((t) => ({
@@ -97,8 +106,11 @@ export function appendSystemSnapshot(
     description: t.description,
     parameters: t.parameters,
     promptGuidelines: t.promptGuidelines,
+    promptSnippet: t.promptSnippet,
   }));
+  const hash = computeHash(session.systemPrompt, toolDefs);
   const snapshot: SystemSnapshotData = {
+    hash,
     systemPrompt: session.systemPrompt,
     toolDefinitions: toolDefs,
     timestamp: new Date().toISOString(),
