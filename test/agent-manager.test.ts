@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agent-manager.js";
 import type { AgentRecord } from "../src/types.js";
@@ -380,6 +381,148 @@ describe("AgentManager — isolation: worktree fails loud, no silent fallback", 
     expect(manager.listAgents()).toEqual([]);
     // runAgent never invoked — strict, no silent fallback
     expect(runAgent).not.toHaveBeenCalled();
+  });
+});
+
+describe("AgentManager — SpawnOptions.cwd passthrough (#96)", () => {
+  let manager: AgentManager;
+  afterEach(() => manager?.dispose());
+
+  it("passes cwd to runAgent as the working dir, parent cwd as configCwd", async () => {
+    resolvedRun();
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+      description: "test",
+      cwd: "/", // absolute and always exists
+    });
+    await manager.getRecord(id)!.promise;
+
+    expect(runAgent).toHaveBeenCalledWith(
+      mockCtx, "general-purpose", "test",
+      expect.objectContaining({ cwd: "/", configCwd: "/tmp" }),
+    );
+  });
+
+  it("without cwd, configCwd stays unset — existing behavior untouched", async () => {
+    // mockClear + lastCall: toHaveBeenCalledWith would scan the file's whole
+    // accumulated call history, where earlier no-cwd spawns already match.
+    vi.mocked(runAgent).mockClear();
+    resolvedRun();
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+      description: "test",
+    });
+    await manager.getRecord(id)!.promise;
+
+    const opts = vi.mocked(runAgent).mock.lastCall![3];
+    expect(opts.cwd).toBeUndefined();
+    expect(opts.configCwd).toBeUndefined();
+  });
+
+  it("cwd: null (RPC 'unset') behaves exactly like omitting cwd", async () => {
+    vi.mocked(runAgent).mockClear();
+    resolvedRun();
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+      description: "test",
+      cwd: null as any,
+    });
+    await manager.getRecord(id)!.promise;
+
+    const opts = vi.mocked(runAgent).mock.lastCall![3];
+    expect(opts.cwd).toBeUndefined();
+    expect(opts.configCwd).toBeUndefined();
+  });
+
+  it("cwd + isolation: worktree — worktree created FROM cwd, session runs at the copy's workPath, cleanup targets cwd's repo", async () => {
+    const { createWorktree, cleanupWorktree } = await import("../src/worktree.js");
+    vi.mocked(createWorktree).mockReturnValueOnce({
+      path: "/wt/copy", branch: "pi-agent-x", baseSha: "abc", workPath: "/wt/copy/packages/api",
+    });
+    resolvedRun();
+
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+      description: "test",
+      cwd: "/",
+      isolation: "worktree",
+    });
+    await manager.getRecord(id)!.promise;
+
+    expect(createWorktree).toHaveBeenCalledWith("/", id);
+    // Worktree wins for the working dir — at workPath, so subdirectory scoping
+    // survives isolation. Config still anchored to the parent.
+    expect(runAgent).toHaveBeenCalledWith(
+      mockCtx, "general-purpose", "test",
+      expect.objectContaining({ cwd: "/wt/copy/packages/api", configCwd: "/tmp" }),
+    );
+    expect(cleanupWorktree).toHaveBeenCalledWith("/", expect.anything(), "test");
+  });
+
+  it("plain worktree (no cwd) keeps the historical root working dir even when workPath differs", async () => {
+    // Parent session sitting in a repo subdirectory: workPath would point at
+    // the copied subdir. Without SpawnOptions.cwd the agent must stay at the
+    // copy's root — moving it would also move .pi config discovery.
+    const { createWorktree } = await import("../src/worktree.js");
+    vi.mocked(createWorktree).mockReturnValueOnce({
+      path: "/wt/copy", branch: "pi-agent-x", baseSha: "abc", workPath: "/wt/copy/sub/dir",
+    });
+    vi.mocked(runAgent).mockClear();
+    resolvedRun();
+
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+      description: "test",
+      isolation: "worktree",
+    });
+    await manager.getRecord(id)!.promise;
+
+    const opts = vi.mocked(runAgent).mock.lastCall![3];
+    expect(opts.cwd).toBe("/wt/copy");
+    expect(opts.configCwd).toBeUndefined();
+  });
+
+  it("relative cwd throws immediately; no orphan record", () => {
+    vi.mocked(runAgent).mockClear();
+    manager = new AgentManager();
+    expect(() => manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+      description: "test",
+      cwd: "relative/path",
+    })).toThrow(/absolute path/);
+    expect(manager.listAgents()).toEqual([]);
+    expect(runAgent).not.toHaveBeenCalled();
+  });
+
+  it("nonexistent cwd throws immediately; no orphan record", () => {
+    vi.mocked(runAgent).mockClear();
+    manager = new AgentManager();
+    expect(() => manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+      description: "test",
+      cwd: "/nonexistent-pi-subagents-test-dir",
+    })).toThrow(/does not exist/);
+    expect(manager.listAgents()).toEqual([]);
+    expect(runAgent).not.toHaveBeenCalled();
+  });
+
+  it("cwd pointing at a regular file throws a curated 'not a directory' error", () => {
+    vi.mocked(runAgent).mockClear();
+    manager = new AgentManager();
+    expect(() => manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+      description: "test",
+      cwd: fileURLToPath(import.meta.url), // this test file: absolute, exists, not a directory
+    })).toThrow(/not a directory/);
+    expect(manager.listAgents()).toEqual([]);
+    expect(runAgent).not.toHaveBeenCalled();
+  });
+
+  it("non-string cwd (RPC junk) throws the curated error, not a TypeError from path internals", () => {
+    vi.mocked(runAgent).mockClear();
+    manager = new AgentManager();
+    expect(() => manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+      description: "test",
+      cwd: 123 as any,
+    })).toThrow(/must be an absolute path/);
+    expect(manager.listAgents()).toEqual([]);
   });
 });
 

@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -68,6 +68,25 @@ describe("worktree", () => {
       } finally {
         rmSync(emptyRepo, { recursive: true, force: true });
       }
+    });
+
+    it("workPath equals path when created from the repo root", () => {
+      const wt = createWorktree(repoDir, "root-wp")!;
+      expect(wt.workPath).toBe(wt.path);
+      try { execFileSync("git", ["worktree", "remove", "--force", wt.path], { cwd: repoDir, stdio: "pipe" }); } catch { /* ignore */ }
+    });
+
+    it("workPath preserves subdirectory scoping (monorepo package cwd)", () => {
+      mkdirSync(join(repoDir, "packages", "api"), { recursive: true });
+      writeFileSync(join(repoDir, "packages", "api", "index.ts"), "export {}");
+      execFileSync("git", ["add", "-A"], { cwd: repoDir, stdio: "pipe" });
+      execFileSync("git", ["commit", "-m", "add package"], { cwd: repoDir, stdio: "pipe" });
+
+      const wt = createWorktree(join(repoDir, "packages", "api"), "subdir-wp")!;
+      expect(wt).toBeDefined();
+      expect(wt.workPath).toBe(join(wt.path, "packages", "api"));
+      expect(existsSync(wt.workPath)).toBe(true);
+      try { execFileSync("git", ["worktree", "remove", "--force", wt.path], { cwd: repoDir, stdio: "pipe" }); } catch { /* ignore */ }
     });
 
     it("uses unique paths for multiple worktrees", () => {

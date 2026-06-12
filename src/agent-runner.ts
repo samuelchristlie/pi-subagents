@@ -206,6 +206,20 @@ export interface RunOptions {
   thinkingLevel?: ThinkingLevel;
   /** Override working directory (e.g. for worktree isolation). */
   cwd?: string;
+  /**
+   * Where .pi config is discovered (project extensions, skills, pi settings,
+   * agent memory). Default: same as the working directory. The manager sets
+   * this to the parent session's cwd when `SpawnOptions.cwd` points the
+   * working directory elsewhere — the agent works *there* but carries the
+   * parent project's config (the target's `.pi` extensions never execute).
+   *
+   * WARNING for future callers: if you pass `cwd` pointing at a directory the
+   * user didn't open, you almost certainly must pass `configCwd` too —
+   * omitting it makes the target's `.pi` extensions execute in this process.
+   * (Worktree isolation is the one intentional exception: its copy IS the
+   * parent's repo, so config resolving inside it is correct.)
+   */
+  configCwd?: string;
   /** Called on tool start/end with activity info. */
   onToolActivity?: (activity: ToolActivity) => void;
   /** Called on streaming text deltas from the assistant response. */
@@ -285,6 +299,9 @@ export async function runAgent(
 
   // Resolve working directory: worktree override > parent cwd
   const effectiveCwd = options.cwd ?? ctx.cwd;
+  // Filesystem work happens in effectiveCwd; config discovery in configCwd.
+  // They differ only for SpawnOptions.cwd spawns (config stays with the parent).
+  const configCwd = options.configCwd ?? effectiveCwd;
 
   const env = await detectEnv(options.pi, effectiveCwd);
 
@@ -303,7 +320,7 @@ export async function runAgent(
 
   // Skill preloading: when skills is string[], preload their content into prompt
   if (Array.isArray(skills)) {
-    const loaded = preloadSkills(skills, effectiveCwd);
+    const loaded = preloadSkills(skills, configCwd);
     if (loaded.length > 0) {
       extras.skillBlocks = loaded;
     }
@@ -323,12 +340,12 @@ export async function runAgent(
       // Read-write memory: add any missing memory tool names (read/write/edit)
       const extraNames = getMemoryToolNames(existingNames);
       if (extraNames.length > 0) toolNames = [...toolNames, ...extraNames];
-      extras.memoryBlock = buildMemoryBlock(agentConfig.name, agentConfig.memory, effectiveCwd);
+      extras.memoryBlock = buildMemoryBlock(agentConfig.name, agentConfig.memory, configCwd);
     } else {
       // Read-only memory: only add read tool name, use read-only prompt
       const extraNames = getReadOnlyMemoryToolNames(existingNames);
       if (extraNames.length > 0) toolNames = [...toolNames, ...extraNames];
-      extras.memoryBlock = buildReadOnlyMemoryBlock(agentConfig.name, agentConfig.memory, effectiveCwd);
+      extras.memoryBlock = buildReadOnlyMemoryBlock(agentConfig.name, agentConfig.memory, configCwd);
     }
   }
 
@@ -373,7 +390,7 @@ export async function runAgent(
   const noExtensions = extensions === false;
 
   const extensionsSpec = Array.isArray(extensions)
-    ? parseExtensionsSpec(extensions, effectiveCwd)
+    ? parseExtensionsSpec(extensions, configCwd)
     : undefined;
   const keepNames = extensionsSpec?.names ?? new Set<string>();
   // `exclude_extensions:` is a denylist applied AFTER the include set — exclude wins.
@@ -407,7 +424,7 @@ export async function runAgent(
         };
 
   const loader = new DefaultResourceLoader({
-    cwd: effectiveCwd,
+    cwd: configCwd,
     agentDir,
     noExtensions,
     additionalExtensionPaths,
@@ -542,7 +559,7 @@ export async function runAgent(
     cwd: effectiveCwd,
     agentDir,
     sessionManager: SessionManager.inMemory(effectiveCwd),
-    settingsManager: SettingsManager.create(effectiveCwd, agentDir),
+    settingsManager: SettingsManager.create(configCwd, agentDir),
     modelRegistry: ctx.modelRegistry,
     model,
     tools: allowedTools,
