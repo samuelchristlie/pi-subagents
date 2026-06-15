@@ -5,6 +5,7 @@
  * matching Claude Code's task output file format.
  */
 
+import { createHash } from "node:crypto";
 import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -34,17 +35,97 @@ export function createOutputFilePath(cwd: string, agentId: string, sessionId: st
   return join(dir, `${agentId}.jsonl`);
 }
 
-/** Write the initial user prompt entry. */
-export function writeInitialEntry(path: string, agentId: string, prompt: string, cwd: string): void {
-  const entry = {
+/** Minimal tool definition shape for serialization. */
+export interface ToolDefSnapshot {
+  name: string;
+  description: string;
+  parameters: unknown;
+  promptGuidelines?: string[];
+  promptSnippet?: string;
+}
+
+/** Compute a stable hash over the system prompt and serialized tool definitions. */
+function computeHash(systemPrompt: string, toolDefs: ToolDefSnapshot[]): string {
+  const payload = JSON.stringify({ systemPrompt, toolDefs });
+  return createHash("sha256").update(payload).digest("hex");
+}
+
+/** Shape of the system_snapshot entry stored in subagent JSONL. */
+export interface SystemSnapshotData {
+  hash: string;
+  systemPrompt: string;
+  toolDefinitions: ToolDefSnapshot[];
+  timestamp: string;
+}
+
+/** Write the initial user prompt entry. Optionally prepend a system snapshot. */
+export function writeInitialEntry(
+  path: string,
+  agentId: string,
+  prompt: string,
+  cwd: string,
+  snapshot?: SystemSnapshotData,
+): void {
+  const lines: string[] = [];
+
+  // Write system snapshot first if provided
+  if (snapshot) {
+    lines.push(JSON.stringify({
+      isSidechain: true,
+      agentId,
+      type: "system_snapshot",
+      data: snapshot,
+      timestamp: snapshot.timestamp,
+      cwd,
+    }));
+  }
+
+  // Write the user prompt entry
+  lines.push(JSON.stringify({
     isSidechain: true,
     agentId,
     type: "user",
     message: { role: "user", content: prompt },
     timestamp: new Date().toISOString(),
     cwd,
+  }));
+
+  writeFileSync(path, lines.join("\n") + "\n", "utf-8");
+}
+
+/** Append a system snapshot entry to an existing output file. */
+export function appendSystemSnapshot(
+  path: string,
+  agentId: string,
+  cwd: string,
+  session: { systemPrompt: string; getAllTools(): Array<{ name: string; description: string; parameters: unknown; promptGuidelines?: string[]; promptSnippet?: string }> },
+): void {
+  const tools = session.getAllTools();
+  const toolDefs: ToolDefSnapshot[] = tools.map((t) => ({
+    name: t.name,
+    description: t.description,
+    parameters: t.parameters,
+    promptGuidelines: t.promptGuidelines,
+    promptSnippet: t.promptSnippet,
+  }));
+  const hash = computeHash(session.systemPrompt, toolDefs);
+  const snapshot: SystemSnapshotData = {
+    hash,
+    systemPrompt: session.systemPrompt,
+    toolDefinitions: toolDefs,
+    timestamp: new Date().toISOString(),
   };
-  writeFileSync(path, JSON.stringify(entry) + "\n", "utf-8");
+  const entry = {
+    isSidechain: true,
+    agentId,
+    type: "system_snapshot",
+    data: snapshot,
+    timestamp: snapshot.timestamp,
+    cwd,
+  };
+  try {
+    appendFileSync(path, JSON.stringify(entry) + "\n", "utf-8");
+  } catch { /* ignore write errors */ }
 }
 
 /**
@@ -56,8 +137,9 @@ export function streamToOutputFile(
   path: string,
   agentId: string,
   cwd: string,
+  extraWrittenCount = 0,
 ): () => void {
-  let writtenCount = 1; // initial user prompt already written
+  let writtenCount = 1 + extraWrittenCount; // initial user prompt + any extra entries (e.g., system_snapshot)
 
   const flush = () => {
     const messages = session.messages;

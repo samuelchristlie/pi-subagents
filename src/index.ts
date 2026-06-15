@@ -24,7 +24,7 @@ import { isModelInScope, readEnabledModels, resolveEnabledModels } from "./enabl
 import { GroupJoinManager } from "./group-join.js";
 import { resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
-import { createOutputFilePath, streamToOutputFile, writeInitialEntry } from "./output-file.js";
+import { appendSystemSnapshot, createOutputFilePath, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
@@ -1105,7 +1105,9 @@ Terse command-style prompts produce shallow, generic work.
           origBgOnSession(session);
           const rec = manager.getRecord(id);
           if (rec?.outputFile) {
-            rec.outputCleanup = streamToOutputFile(session, rec.outputFile, id, ctx.cwd);
+            // Write system snapshot before starting the stream
+            appendSystemSnapshot(rec.outputFile, id, ctx.cwd, session);
+            rec.outputCleanup = streamToOutputFile(session, rec.outputFile, id, ctx.cwd, 1);
           }
         };
 
@@ -1214,7 +1216,9 @@ Terse command-style prompts produce shallow, generic work.
             const outputFile = createOutputFilePath(ctx.cwd, a.id, ctx.sessionManager.getSessionId());
             a.outputFile = outputFile;
             writeInitialEntry(outputFile, a.id, params.prompt, ctx.cwd);
-            a.outputCleanup = streamToOutputFile(session, outputFile, a.id, ctx.cwd);
+            // Write system snapshot before starting the stream
+            appendSystemSnapshot(outputFile, a.id, ctx.cwd, session);
+            a.outputCleanup = streamToOutputFile(session, outputFile, a.id, ctx.cwd, 1);
             fgOutputCleanup = a.outputCleanup;
             break;
           }
