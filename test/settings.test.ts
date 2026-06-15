@@ -89,6 +89,7 @@ describe("settings persistence", () => {
       graceTurns: 3,
       defaultJoinMode: "smart" as const,
       schedulingEnabled: false,
+      toolDescriptionMode: "compact" as const,
     };
     saveSettings(settings, projectDir);
     expect(loadSettings(projectDir)).toEqual(settings);
@@ -215,6 +216,38 @@ describe("settings persistence", () => {
       expect(loadSettings(projectDir).scopeModels).toBeUndefined();
     });
 
+    it("accepts disableDefaultAgents boolean (true and false)", () => {
+      writeProject({ disableDefaultAgents: true });
+      expect(loadSettings(projectDir)).toEqual({ disableDefaultAgents: true });
+      writeProject({ disableDefaultAgents: false });
+      expect(loadSettings(projectDir)).toEqual({ disableDefaultAgents: false });
+    });
+
+    it("drops non-boolean disableDefaultAgents", () => {
+      writeProject({ disableDefaultAgents: "yes" });
+      expect(loadSettings(projectDir).disableDefaultAgents).toBeUndefined();
+      writeProject({ disableDefaultAgents: 1 });
+      expect(loadSettings(projectDir).disableDefaultAgents).toBeUndefined();
+      writeProject({ disableDefaultAgents: null });
+      expect(loadSettings(projectDir).disableDefaultAgents).toBeUndefined();
+    });
+
+    it("accepts all valid toolDescriptionMode values", () => {
+      for (const mode of ["full", "compact", "custom"] as const) {
+        writeProject({ toolDescriptionMode: mode });
+        expect(loadSettings(projectDir)).toEqual({ toolDescriptionMode: mode });
+      }
+    });
+
+    it("drops invalid toolDescriptionMode", () => {
+      writeProject({ toolDescriptionMode: "tiny" });
+      expect(loadSettings(projectDir).toolDescriptionMode).toBeUndefined();
+      writeProject({ toolDescriptionMode: true });
+      expect(loadSettings(projectDir).toolDescriptionMode).toBeUndefined();
+      writeProject({ toolDescriptionMode: null });
+      expect(loadSettings(projectDir).toolDescriptionMode).toBeUndefined();
+    });
+
     it("returns {} when the JSON root is not an object (array, string, null)", () => {
       mkdirSync(join(projectDir, ".pi"), { recursive: true });
       writeFileSync(projectFile(), '["not", "an", "object"]');
@@ -312,6 +345,8 @@ describe("settings persistence", () => {
         setDefaultJoinMode: vi.fn(),
         setSchedulingEnabled: vi.fn(),
         setScopeModels: vi.fn(),
+        setDisableDefaultAgents: vi.fn(),
+        setToolDescriptionMode: vi.fn(),
       };
     });
 
@@ -323,6 +358,8 @@ describe("settings persistence", () => {
       expect(appliers.setDefaultJoinMode).not.toHaveBeenCalled();
       expect(appliers.setSchedulingEnabled).not.toHaveBeenCalled();
       expect(appliers.setScopeModels).not.toHaveBeenCalled();
+      expect(appliers.setDisableDefaultAgents).not.toHaveBeenCalled();
+      expect(appliers.setToolDescriptionMode).not.toHaveBeenCalled();
     });
 
     it("applies only the fields that are present", () => {
@@ -344,6 +381,8 @@ describe("settings persistence", () => {
           defaultJoinMode: "group",
           schedulingEnabled: false,
           scopeModels: true,
+          disableDefaultAgents: true,
+          toolDescriptionMode: "compact",
         },
         appliers,
       );
@@ -353,11 +392,23 @@ describe("settings persistence", () => {
       expect(appliers.setDefaultJoinMode).toHaveBeenCalledWith("group");
       expect(appliers.setSchedulingEnabled).toHaveBeenCalledWith(false);
       expect(appliers.setScopeModels).toHaveBeenCalledWith(true);
+      expect(appliers.setDisableDefaultAgents).toHaveBeenCalledWith(true);
+      expect(appliers.setToolDescriptionMode).toHaveBeenCalledWith("compact");
     });
 
     it("applies scopeModels: false", () => {
       applySettings({ scopeModels: false }, appliers);
       expect(appliers.setScopeModels).toHaveBeenCalledWith(false);
+    });
+
+    it("applies disableDefaultAgents: false", () => {
+      applySettings({ disableDefaultAgents: false }, appliers);
+      expect(appliers.setDisableDefaultAgents).toHaveBeenCalledWith(false);
+    });
+
+    it("applies toolDescriptionMode", () => {
+      applySettings({ toolDescriptionMode: "full" }, appliers);
+      expect(appliers.setToolDescriptionMode).toHaveBeenCalledWith("full");
     });
 
     it("applies defaultMaxTurns: 0 as the explicit unlimited marker", () => {
@@ -414,6 +465,8 @@ describe("settings persistence", () => {
         setDefaultJoinMode: vi.fn(),
         setSchedulingEnabled: vi.fn(),
         setScopeModels: vi.fn(),
+        setDisableDefaultAgents: vi.fn(),
+        setToolDescriptionMode: vi.fn(),
       };
     });
 
