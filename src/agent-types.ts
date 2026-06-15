@@ -24,6 +24,15 @@ export const BUILTIN_TOOL_NAMES: string[] = [
 /** Unified runtime registry of all agents (defaults + user-defined). */
 const agents = new Map<string, AgentConfig>();
 
+/** When true, DEFAULT_AGENTS are skipped during registration. */
+let disableDefaults = false;
+
+/** Check whether default agents are disabled. */
+export function isDefaultsDisabled(): boolean { return disableDefaults; }
+
+/** Set whether default agents are disabled. */
+export function setDefaultsDisabled(b: boolean): void { disableDefaults = b; }
+
 /**
  * Register agents into the unified registry.
  * Starts with DEFAULT_AGENTS, then overlays user agents (overrides defaults with same name).
@@ -32,9 +41,11 @@ const agents = new Map<string, AgentConfig>();
 export function registerAgents(userAgents: Map<string, AgentConfig>): void {
   agents.clear();
 
-  // Start with defaults
-  for (const [name, config] of DEFAULT_AGENTS) {
-    agents.set(name, config);
+  // Start with defaults (unless disabled via settings)
+  if (!disableDefaults) {
+    for (const [name, config] of DEFAULT_AGENTS) {
+      agents.set(name, config);
+    }
   }
 
   // Overlay user agents (overrides defaults with same name)
@@ -133,6 +144,7 @@ export function getConfig(type: string): {
   description: string;
   builtinToolNames: string[];
   extensions: true | string[] | false;
+  excludeExtensions?: string[];
   skills: true | string[] | false;
   promptMode: "replace" | "append";
 } {
@@ -144,6 +156,7 @@ export function getConfig(type: string): {
       description: config.description,
       builtinToolNames: config.builtinToolNames ?? BUILTIN_TOOL_NAMES,
       extensions: config.extensions,
+      excludeExtensions: config.excludeExtensions,
       skills: config.skills,
       promptMode: config.promptMode,
     };
@@ -157,6 +170,7 @@ export function getConfig(type: string): {
       description: gp.description,
       builtinToolNames: gp.builtinToolNames ?? BUILTIN_TOOL_NAMES,
       extensions: gp.extensions,
+      excludeExtensions: gp.excludeExtensions,
       skills: gp.skills,
       promptMode: gp.promptMode,
     };

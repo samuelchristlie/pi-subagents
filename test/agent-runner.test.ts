@@ -832,6 +832,153 @@ describe("agent-runner extension allowlist", () => {
   });
 });
 
+// ─── exclude_extensions: denylist (#94) ──────────────────────────────────
+describe("agent-runner exclude_extensions", () => {
+  function setupAgent(overrides: Record<string, unknown>) {
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig(overrides));
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig(overrides));
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
+  }
+  function extensionErrors(onToolActivity: ReturnType<typeof vi.fn>): string[] {
+    return onToolActivity.mock.calls
+      .map((c) => c[0]?.toolName)
+      .filter((n): n is string => typeof n === "string" && n.startsWith("extension-error:"));
+  }
+
+  it("extensions: true + exclude — override installed, excluded tools dropped, others kept", async () => {
+    setupAgent({ extensions: true, excludeExtensions: ["notify"] });
+    withExtensions({
+      "/ext/notify.ts": ["notify_send"],
+      "/ext/mcp.ts": ["mcp_tool"],
+    });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    const onToolActivity = vi.fn();
+
+    await runAgent(ctx, "Explore", "go", { pi, onToolActivity });
+
+    expect(lastLoaderOpts().extensionsOverride).toBeDefined();
+    const tools = lastToolsPassed();
+    expect(tools).not.toContain("notify_send");
+    expect(tools).toContain("mcp_tool");
+    expect(extensionErrors(onToolActivity)).toEqual([]);
+  });
+
+  it("['*'] + exclude — wildcard no longer short-circuits, exclusion applies", async () => {
+    setupAgent({ extensions: ["*"], excludeExtensions: ["notify"] });
+    withExtensions({
+      "/ext/notify.ts": ["notify_send"],
+      "/ext/mcp.ts": ["mcp_tool"],
+    });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi });
+
+    expect(lastLoaderOpts().extensionsOverride).toBeDefined();
+    const tools = lastToolsPassed();
+    expect(tools).not.toContain("notify_send");
+    expect(tools).toContain("mcp_tool");
+  });
+
+  it("allowlist + exclude of a listed name — subtracted, 'in both' warning fires", async () => {
+    setupAgent({ extensions: ["mcp", "other"], excludeExtensions: ["other"] });
+    withExtensions({
+      "/ext/mcp.ts": ["mcp_tool"],
+      "/ext/other.ts": ["other_tool"],
+    });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    const onToolActivity = vi.fn();
+
+    await runAgent(ctx, "Explore", "go", { pi, onToolActivity });
+
+    const tools = lastToolsPassed();
+    expect(tools).toContain("mcp_tool");
+    expect(tools).not.toContain("other_tool");
+    expect(extensionErrors(onToolActivity)).toEqual([
+      expect.stringContaining('in both extensions: and exclude_extensions:'),
+    ]);
+  });
+
+  it("exclude typo — warning fires, all extensions still load", async () => {
+    setupAgent({ extensions: true, excludeExtensions: ["nope"] });
+    withExtensions({ "/ext/mcp.ts": ["mcp_tool"] });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    const onToolActivity = vi.fn();
+
+    await runAgent(ctx, "Explore", "go", { pi, onToolActivity });
+
+    expect(lastToolsPassed()).toContain("mcp_tool");
+    expect(extensionErrors(onToolActivity)).toEqual([
+      expect.stringContaining('exclude_extensions: "nope"'),
+    ]);
+  });
+
+  it("extensions: false + exclude — orphan warning, no override", async () => {
+    setupAgent({ extensions: false, excludeExtensions: ["notify"] });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    const onToolActivity = vi.fn();
+
+    await runAgent(ctx, "Explore", "go", { pi, onToolActivity });
+
+    expect(lastLoaderOpts().extensionsOverride).toBeUndefined();
+    expect(extensionErrors(onToolActivity)).toEqual([
+      expect.stringContaining("exclude_extensions has no effect"),
+    ]);
+  });
+
+  it("isolated: true + exclude — excludes nulled, no warnings", async () => {
+    setupAgent({ extensions: true, excludeExtensions: ["notify"] });
+    withExtensions({ "/ext/notify.ts": ["notify_send"] });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    const onToolActivity = vi.fn();
+
+    await runAgent(ctx, "Explore", "go", { pi, onToolActivity, isolated: true });
+
+    expect(lastToolsPassed()).not.toContain("notify_send");
+    expect(extensionErrors(onToolActivity)).toEqual([]);
+  });
+
+  it("tools: ext:foo referencing an excluded extension — existing orphan warning fires", async () => {
+    setupAgent({
+      extensions: true,
+      excludeExtensions: ["beta"],
+      extSelectors: ["ext:beta"],
+    });
+    withExtensions({
+      "/ext/beta.ts": ["beta_tool"],
+      "/ext/mcp.ts": ["mcp_tool"],
+    });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    const onToolActivity = vi.fn();
+
+    await runAgent(ctx, "Explore", "go", { pi, onToolActivity });
+
+    expect(lastToolsPassed()).not.toContain("beta_tool");
+    expect(extensionErrors(onToolActivity)).toEqual([
+      expect.stringContaining("extension-error:ext:beta"),
+    ]);
+  });
+
+  it("exclude matches case-insensitively", async () => {
+    setupAgent({ extensions: true, excludeExtensions: ["MCP"] });
+    withExtensions({ "/ext/mcp.ts": ["mcp_tool"] });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    const onToolActivity = vi.fn();
+
+    await runAgent(ctx, "Explore", "go", { pi, onToolActivity });
+
+    expect(lastToolsPassed()).not.toContain("mcp_tool");
+    expect(extensionErrors(onToolActivity)).toEqual([]);
+  });
+});
+
 // ─── unknown built-in tool names in `tools:` (#75) ──────────────────────
 describe("agent-runner unknown built-in tools", () => {
   it("emits a tools-error warning for each plain entry not in BUILTIN_TOOL_NAMES", async () => {

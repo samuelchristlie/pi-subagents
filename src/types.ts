@@ -33,6 +33,9 @@ export interface AgentConfig {
   disallowedTools?: string[];
   /** true = inherit all, string[] = only listed, false = none */
   extensions: true | string[] | false;
+  /** Extension-name denylist applied after the `extensions:` include set. Exclude wins.
+   * Plain canonical names only (case-insensitive); no paths, no wildcard. */
+  excludeExtensions?: string[];
   /** true = inherit all, string[] = only listed, false = none */
   skills: true | string[] | false;
   model?: string;
@@ -80,7 +83,7 @@ export interface AgentRecord {
   /** Steering messages queued before the session was ready. */
   pendingSteers?: string[];
   /** Worktree info if the agent is running in an isolated worktree. */
-  worktree?: { path: string; branch: string };
+  worktree?: { path: string; branch: string; baseSha: string; workPath: string };
   /** Worktree cleanup result after agent completion. */
   worktreeResult?: { hasChanges: boolean; branch?: string };
   /** The tool_use_id from the original Agent tool call. */

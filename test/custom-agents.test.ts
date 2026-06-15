@@ -139,6 +139,49 @@ Partial access.`);
     expect(agent.skills).toEqual(["planning", "review"]);
   });
 
+  it("parses exclude_extensions CSV", () => {
+    writeAgent("no-notify", `---
+extensions: true
+exclude_extensions: pi-notify, telemetry
+---
+
+No notifications.`);
+
+    const result = loadCustomAgents(tmpDir);
+    const agent = result.get("no-notify")!;
+    expect(agent.extensions).toBe(true);
+    expect(agent.excludeExtensions).toEqual(["pi-notify", "telemetry"]);
+  });
+
+  it("parses exclude_extensions YAML list", () => {
+    writeAgent("no-notify-yaml", `---
+exclude_extensions:
+  - pi-notify
+---
+
+No notifications.`);
+
+    const result = loadCustomAgents(tmpDir);
+    expect(result.get("no-notify-yaml")!.excludeExtensions).toEqual(["pi-notify"]);
+  });
+
+  it("exclude_extensions omitted or none → undefined", () => {
+    writeAgent("plain", `---
+description: plain
+---
+
+Plain.`);
+    writeAgent("explicit-none", `---
+exclude_extensions: none
+---
+
+None.`);
+
+    const result = loadCustomAgents(tmpDir);
+    expect(result.get("plain")!.excludeExtensions).toBeUndefined();
+    expect(result.get("explicit-none")!.excludeExtensions).toBeUndefined();
+  });
+
   it("passes through unknown tool names (not filtered)", () => {
     writeAgent("custom-tools", `---
 tools: read, my_custom_tool, grep
