@@ -264,10 +264,38 @@ export default function (pi: ExtensionAPI) {
   const pendingNudges = new Map<string, ReturnType<typeof setTimeout>>();
   const NUDGE_HOLD_MS = 200;
 
+  // When the main agent is mid-run, nudges that fire are deferred to
+  // turn_end rather than sent immediately.  By that point all tool calls
+  // for the turn have executed, so if get_subagent_result already consumed
+  // the result, the send-time resultConsumed check (inside
+  // emitIndividualNudge / the group callback) suppresses it.  Between runs
+  // there is nothing to race against, so nudges fire immediately.
+  //
+  // We query ctx.isIdle() directly instead of tracking a turn_start/turn_end
+  // flag: turn_start is skipped on the first turn of a run, so an event flag
+  // would miss turn 0.  isIdle() (which inverts isStreaming) is false for the
+  // entire run, including turn 0 and response generation.
+  const pendingNudgeSends: Array<() => void> = [];
+
+  pi.on("turn_end", () => {
+    const sends = pendingNudgeSends.splice(0);
+    for (const send of sends) {
+      try { send(); } catch { /* ignore stale completion side-effect errors */ }
+    }
+  });
+
   function scheduleNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS) {
     cancelNudge(key);
     pendingNudges.set(key, setTimeout(() => {
       pendingNudges.delete(key);
+      // Defer to the next turn_end while the main agent is mid-run, so the
+      // send-time resultConsumed check sees any get_subagent_result that ran
+      // in this turn.  When idle, send now — no turn_end is coming, so a
+      // deferred send would never fire.
+      if (currentCtx && !currentCtx.isIdle()) {
+        pendingNudgeSends.push(send);
+        return;
+      }
       try { send(); } catch { /* ignore stale completion side-effect errors */ }
     }, delay));
   }
@@ -489,6 +517,7 @@ export default function (pi: ExtensionAPI) {
     manager.abortAll();
     for (const timer of pendingNudges.values()) clearTimeout(timer);
     pendingNudges.clear();
+    pendingNudgeSends.length = 0;
     manager.dispose();
   });
 
@@ -1319,13 +1348,21 @@ Terse command-style prompts produce shallow, generic work.
       }
 
       // Wait for completion if requested.
-      // Pre-mark resultConsumed BEFORE awaiting: onComplete fires inside .then()
-      // (attached earlier at spawn time) and always runs before this await resumes.
-      // Setting the flag here prevents a redundant follow-up notification.
-      if (params.wait && record.status === "running" && record.promise) {
-        record.resultConsumed = true;
-        cancelNudge(params.agent_id);
-        await record.promise;
+      // Pre-mark resultConsumed BEFORE awaiting (or immediately for already-
+      // completed agents).  onComplete fires inside .then() (attached at
+      // spawn time) and always runs before this await resumes.  Setting the
+      // flag here prevents a redundant follow-up notification.
+      if (params.wait) {
+        if (record.status !== "running" && record.status !== "queued") {
+          // Agent already completed/errored/stopped — suppress any pending
+          // notification before falling through to return the result.
+          record.resultConsumed = true;
+          cancelNudge(params.agent_id);
+        } else if (record.promise) {
+          record.resultConsumed = true;
+          cancelNudge(params.agent_id);
+          await record.promise;
+        }
       }
 
       const displayName = getDisplayName(record.type);
