@@ -732,6 +732,9 @@ async function runAgentLoop(
     }
     if (event.type === "compaction_end" && !event.aborted && event.result) {
       options.onCompaction?.({ reason: event.reason, tokensBefore: event.result.tokensBefore });
+      // Re-inject the original task instruction so it survives compaction.
+      // session.sessionManager is the SessionManager that owns the JSONL.
+      injectTaskInstruction(session.sessionManager, prompt);
     }
   });
 
@@ -770,12 +773,14 @@ export async function resumeAgent(
     onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
     onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
     signal?: AbortSignal;
+    /** Original task instruction for re-injection after compaction. */
+    originalPrompt?: string;
   } = {},
 ): Promise<string> {
   const collector = collectResponseText(session);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
 
-  const unsubEvents = (options.onToolActivity || options.onAssistantUsage || options.onCompaction)
+  const unsubEvents = (options.onToolActivity || options.onAssistantUsage || options.onCompaction || options.originalPrompt)
     ? session.subscribe((event: AgentSessionEvent) => {
         if (event.type === "tool_execution_start") options.onToolActivity?.({ type: "start", toolName: event.toolName });
         if (event.type === "tool_execution_end") options.onToolActivity?.({ type: "end", toolName: event.toolName });
@@ -789,6 +794,8 @@ export async function resumeAgent(
         }
         if (event.type === "compaction_end" && !event.aborted && event.result) {
           options.onCompaction?.({ reason: event.reason, tokensBefore: event.result.tokensBefore });
+          // Re-inject the original task instruction so it survives compaction.
+          injectTaskInstruction(session.sessionManager, options.originalPrompt);
         }
       })
     : () => {};
@@ -818,6 +825,32 @@ export async function steerAgent(
 /**
  * Get the subagent's conversation messages as formatted text.
  */
+const TASK_INSTRUCTION_CUSTOM_TYPE = "subagent:task-instruction";
+
+/**
+ * Inject the original task instruction as a custom_message entry after compaction.
+ *
+ * After a successful compaction the original first user message (the task
+ * instruction) is summarised away. This re-states it as a `custom_message`
+ * entry appended to the session JSONL — it lands after the compaction summary,
+ * so it's always in the "kept" portion and will survive future compactions.
+ *
+ * The message is invisible to the user (no `display` field) but IS included
+ * in the LLM context so the subagent always remembers its original task.
+ */
+export function injectTaskInstruction(
+  sessionManager: SessionManager,
+  prompt: string | undefined,
+): void {
+  if (!prompt) return;
+  sessionManager.appendCustomMessageEntry(
+    TASK_INSTRUCTION_CUSTOM_TYPE,
+    prompt,
+    false,    // display — invisible to the user (no custom UI rendering)
+    undefined, // details
+  );
+}
+
 export function getAgentConversation(session: AgentSession): string {
   const parts: string[] = [];
 

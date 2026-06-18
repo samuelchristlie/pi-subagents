@@ -108,6 +108,7 @@ vi.mock("../src/skill-loader.js", () => ({
 import {
   extensionCanonicalName,
   getAgentConversation,
+  injectTaskInstruction,
   parseExtensionsSpec,
   parseExtSelectors,
   resumeAgent,
@@ -116,8 +117,12 @@ import {
 
 function createSession(finalText: string) {
   const listeners: Array<(event: any) => void> = [];
+  const mockSessionManager = {
+    appendCustomMessageEntry: vi.fn(() => "entry-id"),
+  };
   const session = {
     messages: [] as any[],
+    sessionManager: mockSessionManager,
     subscribe: vi.fn((listener: (event: any) => void) => {
       listeners.push(listener);
       return () => {};
@@ -135,7 +140,7 @@ function createSession(finalText: string) {
     setSessionName: vi.fn(),
     bindExtensions: vi.fn(async () => {}),
   };
-  return { session, listeners };
+  return { session, listeners, mockSessionManager };
 }
 
 const ctx = {
@@ -1365,5 +1370,151 @@ describe("agent-runner ext: tool selectors", () => {
     expect(tools).toContain("read");
     expect(tools).toContain("foo_other");
     expect(tools).not.toContain("foo_tool"); // denylisted even though ext:foo selects it
+  });
+});
+
+// ─── injectTaskInstruction: re-inject original prompt after compaction ─
+// When pi auto-compacts a session, the original task instruction (first user
+// message) gets summarised away. `injectTaskInstruction` re-states it as a
+// custom_message entry so the subagent always remembers its original task.
+describe("injectTaskInstruction", () => {
+  it("calls appendCustomMessageEntry with the custom type and prompt", () => {
+    const sm = { appendCustomMessageEntry: vi.fn(() => "id") } as any;
+    injectTaskInstruction(sm, "Do the thing");
+
+    expect(sm.appendCustomMessageEntry).toHaveBeenCalledWith(
+      "subagent:task-instruction",
+      "Do the thing",
+      false,
+      undefined,
+    );
+  });
+
+  it("does not inject when prompt is empty", () => {
+    const sm = { appendCustomMessageEntry: vi.fn(() => "id") } as any;
+    injectTaskInstruction(sm, "");
+    injectTaskInstruction(sm, undefined as any);
+
+    expect(sm.appendCustomMessageEntry).not.toHaveBeenCalled();
+  });
+
+  it("does not inject when prompt is undefined", () => {
+    const sm = { appendCustomMessageEntry: vi.fn(() => "id") } as any;
+    injectTaskInstruction(sm, undefined as any);
+
+    expect(sm.appendCustomMessageEntry).not.toHaveBeenCalled();
+  });
+});
+
+// ─── compaction_end triggers injectTaskInstruction in runAgent ────────
+describe("runAgent compaction injection", () => {
+  it("injects the task instruction on successful compaction_end", async () => {
+    const { session, listeners, mockSessionManager } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    session.prompt = vi.fn(async () => {
+      // Emit a successful compaction
+      for (const l of listeners) l({
+        type: "compaction_end",
+        aborted: false,
+        reason: "threshold",
+        result: { tokensBefore: 50000 },
+      });
+      session.messages.push({ role: "assistant", content: [{ type: "text", text: "OK" }] });
+    });
+
+    await runAgent(ctx, "Explore", "Fix the bug", { pi });
+
+    expect(mockSessionManager.appendCustomMessageEntry).toHaveBeenCalledWith(
+      "subagent:task-instruction",
+      "Fix the bug",
+      false,
+      undefined,
+    );
+  });
+
+  it("does not inject on aborted compaction", async () => {
+    const { session, listeners, mockSessionManager } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    session.prompt = vi.fn(async () => {
+      for (const l of listeners) l({
+        type: "compaction_end",
+        aborted: true,
+        reason: "manual",
+        result: { tokensBefore: 99999 },
+      });
+      session.messages.push({ role: "assistant", content: [{ type: "text", text: "OK" }] });
+    });
+
+    await runAgent(ctx, "Explore", "Fix the bug", { pi });
+
+    expect(mockSessionManager.appendCustomMessageEntry).not.toHaveBeenCalled();
+  });
+});
+
+// ─── compaction_end triggers injectTaskInstruction in resumeAgent ──────
+describe("resumeAgent compaction injection", () => {
+  it("injects originalPrompt on successful compaction_end", async () => {
+    const { session, listeners, mockSessionManager } = createSession("RESUMED");
+
+    session.prompt = vi.fn(async () => {
+      for (const l of listeners) l({
+        type: "compaction_end",
+        aborted: false,
+        reason: "threshold",
+        result: { tokensBefore: 50000 },
+      });
+      session.messages.push({ role: "assistant", content: [{ type: "text", text: "RESUMED" }] });
+    });
+
+    await resumeAgent(session as any, "continue", {
+      originalPrompt: "Original task instruction",
+    });
+
+    expect(mockSessionManager.appendCustomMessageEntry).toHaveBeenCalledWith(
+      "subagent:task-instruction",
+      "Original task instruction",
+      false,
+      undefined,
+    );
+  });
+
+  it("does not inject when originalPrompt is not provided", async () => {
+    const { session, listeners, mockSessionManager } = createSession("RESUMED");
+
+    session.prompt = vi.fn(async () => {
+      for (const l of listeners) l({
+        type: "compaction_end",
+        aborted: false,
+        reason: "threshold",
+        result: { tokensBefore: 50000 },
+      });
+      session.messages.push({ role: "assistant", content: [{ type: "text", text: "RESUMED" }] });
+    });
+
+    await resumeAgent(session as any, "continue");
+
+    expect(mockSessionManager.appendCustomMessageEntry).not.toHaveBeenCalled();
+  });
+
+  it("does not inject on aborted compaction even with originalPrompt", async () => {
+    const { session, listeners, mockSessionManager } = createSession("RESUMED");
+
+    session.prompt = vi.fn(async () => {
+      for (const l of listeners) l({
+        type: "compaction_end",
+        aborted: true,
+        reason: "manual",
+        result: { tokensBefore: 99999 },
+      });
+      session.messages.push({ role: "assistant", content: [{ type: "text", text: "RESUMED" }] });
+    });
+
+    await resumeAgent(session as any, "continue", {
+      originalPrompt: "Original task instruction",
+    });
+
+    expect(mockSessionManager.appendCustomMessageEntry).not.toHaveBeenCalled();
   });
 });

@@ -194,6 +194,7 @@ export class AgentManager {
       abortController,
       lifetimeUsage: { input: 0, output: 0, cacheWrite: 0 },
       compactionCount: 0,
+      originalPrompt: prompt,
       invocation: options.invocation,
     };
     this.agents.set(id, record);
@@ -510,6 +511,7 @@ export class AgentManager {
           this.onCompact?.(record, info);
         },
         signal: options.signal,
+        originalPrompt: record.originalPrompt,
       });
       record.status = "completed";
       record.result = responseText;
