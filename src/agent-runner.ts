@@ -695,6 +695,19 @@ async function runAgentLoop(
   let aborted = false;
 
   let currentMessageText = "";
+
+  // Build the effective prompt: optionally prepend parent context. Computed
+  // before the subscriber below so the compaction injection re-states the
+  // actual LLM input (parent context + prompt), not the raw `prompt`.
+  const parentContext = options.inheritContext ? buildParentContext(ctx) : undefined;
+  const effectivePrompt = parentContext ? parentContext + prompt : prompt;
+
+  // Compaction injection runs at most once per prompt() call: if compaction
+  // fires multiple times the task instruction only needs re-stating once
+  // (later compactions keep it — it lands after the first summary). Gating
+  // avoids duplicate injections that waste tokens and confuse the model.
+  let taskInstructionInjected = false;
+
   const unsubTurns = session.subscribe((event: AgentSessionEvent) => {
     if (event.type === "turn_end") {
       turnCount++;
@@ -734,21 +747,15 @@ async function runAgentLoop(
       options.onCompaction?.({ reason: event.reason, tokensBefore: event.result.tokensBefore });
       // Re-inject the original task instruction so it survives compaction.
       // session.sessionManager is the SessionManager that owns the JSONL.
-      injectTaskInstruction(session.sessionManager, prompt);
+      if (!taskInstructionInjected) {
+        injectTaskInstruction(session.sessionManager, effectivePrompt);
+        taskInstructionInjected = true;
+      }
     }
   });
 
   const collector = collectResponseText(session);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
-
-  // Build the effective prompt: optionally prepend parent context
-  let effectivePrompt = prompt;
-  if (options.inheritContext) {
-    const parentContext = buildParentContext(ctx);
-    if (parentContext) {
-      effectivePrompt = parentContext + prompt;
-    }
-  }
 
   try {
     await session.prompt(effectivePrompt);
@@ -780,6 +787,11 @@ export async function resumeAgent(
   const collector = collectResponseText(session);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
 
+  // Compaction injection runs at most once per prompt() call — see
+  // runAgentLoop for the rationale. Gating avoids duplicate injections when
+  // compaction fires more than once in a single resume prompt cycle.
+  let taskInstructionInjected = false;
+
   const unsubEvents = (options.onToolActivity || options.onAssistantUsage || options.onCompaction || options.originalPrompt)
     ? session.subscribe((event: AgentSessionEvent) => {
         if (event.type === "tool_execution_start") options.onToolActivity?.({ type: "start", toolName: event.toolName });
@@ -795,7 +807,10 @@ export async function resumeAgent(
         if (event.type === "compaction_end" && !event.aborted && event.result) {
           options.onCompaction?.({ reason: event.reason, tokensBefore: event.result.tokensBefore });
           // Re-inject the original task instruction so it survives compaction.
-          injectTaskInstruction(session.sessionManager, options.originalPrompt);
+          if (!taskInstructionInjected) {
+            injectTaskInstruction(session.sessionManager, options.originalPrompt);
+            taskInstructionInjected = true;
+          }
         }
       })
     : () => {};
@@ -819,6 +834,10 @@ export async function steerAgent(
   session: AgentSession,
   message: string,
 ): Promise<void> {
+  // Compaction injection is intentionally absent here. steer() is a mid-stream
+  // nudge that interleaves a message during the current turn — not a full
+  // prompt cycle — so the original task instruction is still in context and
+  // there is nothing to re-inject.
   await session.steer(message);
 }
 
@@ -838,7 +857,7 @@ const TASK_INSTRUCTION_CUSTOM_TYPE = "subagent:task-instruction";
  * The message is invisible to the user (no `display` field) but IS included
  * in the LLM context so the subagent always remembers its original task.
  */
-export function injectTaskInstruction(
+function injectTaskInstruction(
   sessionManager: SessionManager,
   prompt: string | undefined,
 ): void {
