@@ -321,6 +321,111 @@ describe("ConversationViewer", () => {
     });
   });
 
+  describe("control-character sanitization (outline-disconnect glitch)", () => {
+    // A raw \r in content snaps the terminal cursor back to column 0 at write
+    // time, clobbering the left border \u2502 and stranding old text mid-box —
+    // the modal outline visually "disconnects" / content gains a spurious indent.
+    // Tabs drift the right border (terminal tab-stops vs. visibleWidth's 3-space
+    // assumption). All such C0 controls must be stripped/normalized before wrap.
+
+    /** Call the private buildContentLines method directly. */
+    function callBuildContentLines(viewer: InstanceType<typeof ConversationViewer>, width: number): string[] {
+      return (viewer as any).buildContentLines(width);
+    }
+
+    it("strips carriage returns from toolResult content", () => {
+      const w = 80;
+      const messages = [
+        { role: "toolResult", toolUseId: "t1", content: [{ type: "text", text: "Downloading packages\rProgress: 100% done" }] },
+      ];
+      const viewer = new ConversationViewer(
+        mockTui(30, w), mockSession(messages), mockRecord(), undefined, ansiTheme(), vi.fn(),
+      );
+      const lines = callBuildContentLines(viewer, w);
+      for (const line of lines) {
+        expect(line, JSON.stringify(line)).not.toContain("\r");
+      }
+      // The post-\r segment survives (on its own line), not lost.
+      expect(lines.join("\n")).toContain("Progress: 100% done");
+      expect(lines.join("\n")).toContain("Downloading packages");
+    });
+
+    it("normalizes CRLF and lone CR in bashExecution output", () => {
+      const w = 80;
+      const messages = [
+        {
+          role: "bashExecution",
+          command: "npm install",
+          output: "line1\r\nline2\rline3",
+          exitCode: 0, cancelled: false, truncated: false, timestamp: Date.now(),
+        },
+      ];
+      const viewer = new ConversationViewer(
+        mockTui(30, w), mockSession(messages), mockRecord(), undefined, ansiTheme(), vi.fn(),
+      );
+      const lines = callBuildContentLines(viewer, w);
+      for (const line of lines) {
+        expect(line, JSON.stringify(line)).not.toContain("\r");
+      }
+      expect(lines.join("\n")).toContain("line1");
+      expect(lines.join("\n")).toContain("line2");
+      expect(lines.join("\n")).toContain("line3");
+    });
+
+    it("expands tabs to spaces so the right border stays aligned", () => {
+      const w = 80;
+      const messages = [
+        { role: "toolResult", toolUseId: "t1", content: [{ type: "text", text: "\tindented\twith\ttabs" }] },
+      ];
+      const viewer = new ConversationViewer(
+        mockTui(30, w), mockSession(messages), mockRecord(), undefined, ansiTheme(), vi.fn(),
+      );
+      const lines = callBuildContentLines(viewer, w);
+      for (const line of lines) {
+        expect(line, JSON.stringify(line)).not.toContain("\t");
+      }
+      assertAllLinesFit(lines, w);
+    });
+
+    it("strips backspace / vtab / formfeed and other C0 controls", () => {
+      const w = 80;
+      const messages = [
+        { role: "user", content: "a\bb\vc\fd\x07e" },
+      ];
+      const viewer = new ConversationViewer(
+        mockTui(30, w), mockSession(messages), mockRecord(), undefined, ansiTheme(), vi.fn(),
+      );
+      const lines = callBuildContentLines(viewer, w);
+      const joined = lines.join("");
+      expect(joined).not.toContain("\b");
+      expect(joined).not.toContain("\v");
+      expect(joined).not.toContain("\f");
+      expect(joined).not.toContain("\x07");
+      // printable survivors are kept
+      expect(joined).toContain("a");
+      expect(joined).toContain("e");
+    });
+
+    it("full render() output contains no raw \r or \t across all message kinds", () => {
+      const w = 60;
+      const messages = [
+        { role: "user", content: "u\r1\t2" },
+        { role: "assistant", content: [{ type: "text", text: "a\rb\tc" }] },
+        { role: "toolResult", toolUseId: "t1", content: [{ type: "text", text: "r\rs\tt" }] },
+        { role: "bashExecution", command: "cmd\targ", output: "o\rout", exitCode: 0, cancelled: false, truncated: false, timestamp: Date.now() },
+      ];
+      const viewer = new ConversationViewer(
+        mockTui(30, w), mockSession(messages), mockRecord(), undefined, ansiTheme(), vi.fn(),
+      );
+      const lines = viewer.render(w);
+      for (let i = 0; i < lines.length; i++) {
+        expect(lines[i], `line ${i}: ${JSON.stringify(lines[i])}`).not.toContain("\r");
+        expect(lines[i], `line ${i}: ${JSON.stringify(lines[i])}`).not.toContain("\t");
+      }
+      assertAllLinesFit(lines, w);
+    });
+  });
+
   describe("stop key", () => {
     const W = 80;
 

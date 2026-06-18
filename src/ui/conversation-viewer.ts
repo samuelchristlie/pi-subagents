@@ -20,6 +20,28 @@ const MIN_VIEWPORT = 3;
 /** Height ceiling shared by the overlay's `maxHeight` and the viewer's internal viewport cap. */
 export const VIEWPORT_HEIGHT_PCT = 70;
 
+/**
+ * Sanitize extracted text for display inside the bordered overlay.
+ *
+ * `wrapTextWithAnsi` only splits on `\n`; raw C0 control chars pass through and the
+ * terminal interprets them at write time. A `\r` snaps the cursor back to column 0,
+ * so the rest of the line overwrites the left border `│` and strands a fragment of
+ * the old text mid-box — the modal's outline visually "disconnects" and content
+ * gains a spurious indent. Tabs (`\t`) drift the right border because the terminal
+ * expands them to 8-col stops while `visibleWidth` assumes 3 spaces. Backspace /
+ * vtab / formfeed cause the same class of cursor-motion glitch.
+ *
+ * Mirrors pi core's `BashExecutionComponent` normalization (`\r\n`→`\n`, lone `\r`→`\n`)
+ * and additionally expands tabs and strips the remaining C0 controls (except `\n`).
+ */
+function sanitizeText(text: string): string {
+  return text
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/\t/g, "   ")
+    .replace(/[\x00-\x08\x0b-\x1f]/g, "");
+}
+
 export class ConversationViewer implements Component {
   private scrollOffset = 0;
   private autoScroll = true;
@@ -230,9 +252,9 @@ export class ConversationViewer implements Component {
     let needsSeparator = false;
     for (const msg of messages) {
       if (msg.role === "user") {
-        const text = typeof msg.content === "string"
+        const text = sanitizeText(typeof msg.content === "string"
           ? msg.content
-          : extractText(msg.content);
+          : extractText(msg.content));
         if (!text.trim()) continue;
         if (needsSeparator) lines.push(th.fg("dim", "───"));
         lines.push(th.fg("accent", "[User]"));
@@ -251,7 +273,8 @@ export class ConversationViewer implements Component {
         if (needsSeparator) lines.push(th.fg("dim", "───"));
         lines.push(th.bold("[Assistant]"));
         if (textParts.length > 0) {
-          for (const line of wrapTextWithAnsi(textParts.join("\n").trim(), width)) {
+          const joined = sanitizeText(textParts.join("\n"));
+          for (const line of wrapTextWithAnsi(joined.trim(), width)) {
             lines.push(line);
           }
         }
@@ -259,7 +282,7 @@ export class ConversationViewer implements Component {
           lines.push(truncateToWidth(th.fg("muted", `  [Tool: ${name}]`), width));
         }
       } else if (msg.role === "toolResult") {
-        const text = extractText(msg.content);
+        const text = sanitizeText(extractText(msg.content));
         const truncated = text.length > 500 ? text.slice(0, 500) + "... (truncated)" : text;
         if (!truncated.trim()) continue;
         if (needsSeparator) lines.push(th.fg("dim", "───"));
@@ -270,11 +293,11 @@ export class ConversationViewer implements Component {
       } else if ((msg as any).role === "bashExecution") {
         const bash = msg as any;
         if (needsSeparator) lines.push(th.fg("dim", "───"));
-        lines.push(truncateToWidth(th.fg("muted", `  $ ${bash.command}`), width));
+        lines.push(truncateToWidth(th.fg("muted", `  $ ${sanitizeText(bash.command ?? "")}`), width));
         if (bash.output?.trim()) {
-          const out = bash.output.length > 500
+          const out = sanitizeText(bash.output.length > 500
             ? bash.output.slice(0, 500) + "... (truncated)"
-            : bash.output;
+            : bash.output);
           for (const line of wrapTextWithAnsi(out.trim(), width)) {
             lines.push(th.fg("dim", line));
           }
