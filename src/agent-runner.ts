@@ -5,13 +5,14 @@
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, resolve } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
-import type { ExtensionContext, LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
+import type { LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
 import {
   type AgentSession,
   type AgentSessionEvent,
   createAgentSession,
   DefaultResourceLoader,
   type ExtensionAPI,
+  type ExtensionContext,
   getAgentDir,
   SessionManager,
   SettingsManager,
@@ -193,19 +194,43 @@ export interface ToolActivity {
   toolName: string;
 }
 
-export interface RunOptions {
+/**
+ * Options that influence session *construction* (loader, tools, prompt, model).
+ * Shared by `runAgent` (fresh spawn) and `rehydrateAgent` (rebuild from disk)
+ * so both paths produce an equivalent session — only the SessionManager differs
+ * (inMemory vs persisted vs opened-from-disk).
+ */
+export interface SessionBuildOptions {
   /** ExtensionAPI instance — used for pi.exec() instead of execSync. */
   pi: ExtensionAPI;
   /** Manager-assigned id; suffixes session name to disambiguate parallel spawns (e.g. `Explore#a1b2c3d4`). */
   agentId?: string;
   model?: Model<any>;
-  maxTurns?: number;
-  signal?: AbortSignal;
   isolated?: boolean;
-  inheritContext?: boolean;
   thinkingLevel?: ThinkingLevel;
   /** Override working directory (e.g. for worktree isolation). */
   cwd?: string;
+  /**
+   * Where .pi config is discovered (project extensions, skills, pi settings,
+   * agent memory). Default: same as the working directory.
+   */
+  configCwd?: string;
+  /** Called with setup-time warnings (unknown tools, missing extensions). */
+  onToolActivity?: (activity: ToolActivity) => void;
+}
+
+export interface RunOptions extends SessionBuildOptions {
+  maxTurns?: number;
+  signal?: AbortSignal;
+  inheritContext?: boolean;
+  /**
+   * Directory for the persisted session JSONL. When set, the session is
+   * created via `SessionManager.create(cwd, sessionDir)` and written to disk
+   * in pi's standard session format — reloadable later via `SessionManager.open()`.
+   * When omitted, the session is in-memory only (lost on cleanup).
+   * The directory is created if it doesn't exist.
+   */
+  sessionDir?: string;
   /**
    * Where .pi config is discovered (project extensions, skills, pi settings,
    * agent memory). Default: same as the working directory. The manager sets
@@ -219,9 +244,6 @@ export interface RunOptions {
    * (Worktree isolation is the one intentional exception: its copy IS the
    * parent's repo, so config resolving inside it is correct.)
    */
-  configCwd?: string;
-  /** Called on tool start/end with activity info. */
-  onToolActivity?: (activity: ToolActivity) => void;
   /** Called on streaming text deltas from the assistant response. */
   onTextDelta?: (delta: string, fullText: string) => void;
   onSessionCreated?: (session: AgentSession) => void;
@@ -294,6 +316,67 @@ export async function runAgent(
   prompt: string,
   options: RunOptions,
 ): Promise<RunResult> {
+  // Resolve working directory: worktree override > parent cwd
+  const effectiveCwd = options.cwd ?? ctx.cwd;
+
+  // Persist the session to disk in pi's standard JSONL format when sessionDir
+  // is supplied (so it can be reloaded later via SessionManager.open). Default
+  // is in-memory only — backward compatible with tests and any caller that
+  // doesn't need persistence. The directory is created if missing.
+  const sessionManager = options.sessionDir
+    ? SessionManager.create(effectiveCwd, options.sessionDir)
+    : SessionManager.inMemory(effectiveCwd);
+
+  const { session } = await buildSessionDeps(ctx, type, options, sessionManager);
+
+  options.onSessionCreated?.(session);
+
+  return runAgentLoop(ctx, type, prompt, options, session);
+}
+
+/**
+ * Rehydrate an AgentSession from a persisted JSONL file.
+ *
+ * This is the slow path for `manager.resume()`: the live session was cleaned
+ * up, but the JSONL is still on disk. We open it with SessionManager.open()
+ * and reconstruct the full session config (loader, tools, prompt, model) from
+ * the agent type + snapshot — so the rehydrated session is functionally
+ * equivalent to a fresh spawn, just with the prior conversation already loaded.
+ *
+ * The agent type's frontmatter is the source of truth for tools/extensions,
+ * same as a fresh spawn. If the agent definition changed between spawn and
+ * resume, the rehydrated session picks up the new definition — that's the
+ * least-surprising behavior (matching how pi itself reloads sessions).
+ */
+export async function rehydrateAgent(
+  ctx: ExtensionContext,
+  type: SubagentType,
+  sessionFilePath: string,
+  options: SessionBuildOptions,
+): Promise<AgentSession> {
+  const sessionManager = SessionManager.open(sessionFilePath);
+  const { session } = await buildSessionDeps(ctx, type, options, sessionManager);
+  return session;
+}
+
+/**
+ * Build a fully-configured AgentSession for `type` against `sessionManager`.
+ * Shared by runAgent (fresh spawn, possibly persisted) and rehydrateAgent
+ * (open-from-disk). Returns the session with extensions already bound and the
+ * session name set.
+ *
+ * The SessionManager controls persistence: inMemory for ephemeral runs,
+ * SessionManager.create for fresh persisted runs, SessionManager.open to
+ * reload an existing JSONL. Everything else (loader, tools, prompt, model) is
+ * reconstructed from `type` + the agent config — that's what makes a rehydrated
+ * session functionally equivalent to a fresh one.
+ */
+async function buildSessionDeps(
+  ctx: ExtensionContext,
+  type: SubagentType,
+  options: SessionBuildOptions,
+  sessionManager: SessionManager,
+): Promise<{ session: AgentSession; systemPrompt: string; allowedTools: string[] }> {
   const config = getConfig(type);
   const agentConfig = getAgentConfig(type);
 
@@ -558,7 +641,7 @@ export async function runAgent(
   const sessionOpts: Parameters<typeof createAgentSession>[0] = {
     cwd: effectiveCwd,
     agentDir,
-    sessionManager: SessionManager.inMemory(effectiveCwd),
+    sessionManager,
     settingsManager: SettingsManager.create(configCwd, agentDir),
     modelRegistry: ctx.modelRegistry,
     model,
@@ -589,7 +672,21 @@ export async function runAgent(
     },
   });
 
-  options.onSessionCreated?.(session);
+  return { session, systemPrompt, allowedTools };
+}
+
+/**
+ * Drive an already-built session through one prompt + max-turns loop.
+ * Extracted from runAgent so buildSessionDeps stays focused on construction.
+ */
+async function runAgentLoop(
+  ctx: ExtensionContext,
+  type: SubagentType,
+  prompt: string,
+  options: RunOptions,
+  session: AgentSession,
+): Promise<RunResult> {
+  const agentConfig = getAgentConfig(type);
 
   // Track turns for graceful max_turns enforcement
   let turnCount = 0;

@@ -23,13 +23,13 @@
  * provider registers in a different `pi-ai` module instance than the one
  * pi-coding-agent streams through, which is brittle and orthogonal to gating.)
  */
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { registerFauxProvider } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { extensionCanonicalName, runAgent } from "../src/agent-runner.js";
+import { extensionCanonicalName, rehydrateAgent, runAgent } from "../src/agent-runner.js";
 import { registerAgents } from "../src/agent-types.js";
 import type { AgentConfig } from "../src/types.js";
 
@@ -157,5 +157,80 @@ describe("agent-runner end-to-end (real pi-mono session + real extension)", () =
     expect(active).toContain(EXT_TOOL); // selected → surfaces despite the flip
     expect(active).toContain("read");
     expect(active).not.toContain("bash"); // builtinToolNames: ["read"] only
+  });
+
+  // ─── persistence: runAgent writes a real pi-format JSONL when sessionDir is set ─
+  // Closing the loop on the persistence work: when runAgent is called with a
+  // sessionDir, the resulting AgentSession has a real sessionFile on disk in
+  // pi's standard format — and that file is loadable via rehydrateAgent, which
+  // produces a new session with the original messages and the same tool set.
+  it("runAgent writes a real pi-format JSONL when sessionDir is supplied", async () => {
+    registerAgents(new Map([
+      ["e2e", {
+        name: "e2e", description: "e2e",
+        builtinToolNames: BUILTINS, extensions: false, skills: false,
+        systemPrompt: "You are e2e.", promptMode: "replace",
+        inheritContext: false, runInBackground: false, isolated: false,
+      } as AgentConfig],
+    ]));
+    const model = faux.getModel();
+    const modelRegistry: any = { find: () => model, getAvailable: () => [model], hasConfiguredAuth: () => true, isUsingOAuth: () => false, getApiKeyAndHeaders: async () => ({ apiKey: "faux", headers: {} }) };
+    const ctx: any = { cwd, getSystemPrompt: () => "PARENT", model, modelRegistry };
+    const sessionDir = join(cwd, "subagents-sessiondir");
+
+    let createdSession: any;
+    try {
+      await runAgent(ctx, "e2e", "hello", {
+        pi: makePi(), model, sessionDir,
+        onSessionCreated: (s) => { createdSession = s; },
+      });
+    } catch { /* faux model may error on prompt — session creation is what matters */ }
+
+    expect(createdSession).toBeDefined();
+    const filePath = createdSession.sessionFile;
+    expect(typeof filePath).toBe("string");
+    expect(filePath.startsWith(sessionDir)).toBe(true);
+    expect(existsSync(filePath)).toBe(true);
+
+    // File starts with the pi session header (type=session, version=3)
+    const firstLine = JSON.parse(readFileSync(filePath, "utf-8").split("\n")[0]);
+    expect(firstLine.type).toBe("session");
+    expect(firstLine.version).toBe(3);
+    expect(firstLine.cwd).toBe(cwd);
+  });
+
+  it("rehydrateAgent reloads the persisted JSONL and produces an equivalent session", async () => {
+    registerAgents(new Map([
+      ["e2e", {
+        name: "e2e", description: "e2e",
+        builtinToolNames: BUILTINS, extensions: false, skills: false,
+        systemPrompt: "You are e2e.", promptMode: "replace",
+        inheritContext: false, runInBackground: false, isolated: false,
+      } as AgentConfig],
+    ]));
+    const model = faux.getModel();
+    const modelRegistry: any = { find: () => model, getAvailable: () => [model], hasConfiguredAuth: () => true, isUsingOAuth: () => false, getApiKeyAndHeaders: async () => ({ apiKey: "faux", headers: {} }) };
+    const ctx: any = { cwd, getSystemPrompt: () => "PARENT", model, modelRegistry };
+    const sessionDir = join(cwd, "subagents-rehydrate");
+
+    // Phase 1: spawn, capture the file path, dispose the in-memory session.
+    let filePath: string | undefined;
+    let originalActiveTools: string[] = [];
+    try {
+      await runAgent(ctx, "e2e", "hello", {
+        pi: makePi(), model, sessionDir,
+        onSessionCreated: (s) => {
+          filePath = s.sessionFile;
+          originalActiveTools = s.getActiveToolNames();
+        },
+      });
+    } catch { /* faux model errors are fine */ }
+    expect(filePath).toBeDefined();
+
+    // Phase 2: rehydrate from disk — same agent type, same cwd.
+    const rehydrated = await rehydrateAgent(ctx, "e2e", filePath!, { pi: makePi(), model });
+    expect(rehydrated).toBeDefined();
+    expect(rehydrated.sessionFile).toBe(filePath);
+    expect(rehydrated.getActiveToolNames().sort()).toEqual(originalActiveTools.sort());
   });
 });

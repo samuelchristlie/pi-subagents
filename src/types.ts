@@ -93,6 +93,20 @@ export interface AgentRecord {
   /** Cleanup function for the output file stream subscription. */
   outputCleanup?: () => void;
   /**
+   * Path to the persisted pi-format session JSONL, set when the session is
+   * created with `sessionDir`. Used by `manager.resume()` to rehydrate the
+   * session after the in-memory reference is cleaned up. The file is NOT
+   * deleted on cleanup — only the in-memory `session` reference is dropped.
+   */
+  sessionFilePath?: string;
+  /**
+   * Snapshot of the spawn config needed to rehydrate the session later.
+   * Captured at spawn time so `manager.resume()` can rebuild a functionally
+   * equivalent session even after the in-memory `session` reference is gone
+   * — without having to remember the caller's original spawn options.
+   */
+  configSnapshot?: AgentConfigSnapshot;
+  /**
    * Lifetime usage breakdown, accumulated via `message_end` events. Survives
    * compaction. Total = input + output + cacheWrite (cacheRead deliberately
    * excluded — see issue #38). Initialized to zeros at spawn.
@@ -102,6 +116,30 @@ export interface AgentRecord {
   compactionCount: number;
   /** Resolved spawn params, captured for UI display. Fixed at spawn time. */
   invocation?: AgentInvocation;
+}
+
+/**
+ * Snapshot of the spawn-time config needed to rehydrate a session from disk.
+ *
+ * Only the fields that influence `createAgentSession()` / `buildSessionDeps()` and
+ * can't be re-derived from the agent type alone. The agent type's frontmatter is
+ * still the source of truth for tools/extensions/skills — if the definition
+ * changed since spawn, the rehydrated session picks up the new one. This
+ * snapshot just records the per-spawn overrides.
+ */
+export interface AgentConfigSnapshot {
+  /**
+   * `"provider/modelId"` of the resolved model at spawn time. On rehydrate we
+   * look this up via `ctx.modelRegistry.find(provider, modelId)`; if the model
+   * is no longer available we fall back to the agent config / parent model.
+   */
+  resolvedModelKey?: string;
+  thinkingLevel?: ThinkingLevel;
+  isolated?: boolean;
+  /** Working directory passed to createAgentSession (effective cwd). */
+  cwd?: string;
+  /** Directory where .pi config was discovered. */
+  configCwd?: string;
 }
 
 export interface AgentInvocation {

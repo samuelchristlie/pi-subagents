@@ -35,6 +35,21 @@ export function createOutputFilePath(cwd: string, agentId: string, sessionId: st
   return join(dir, `${agentId}.jsonl`);
 }
 
+/**
+ * Directory holding a subagent's persisted pi-format session JSONL.
+ *
+ * Sibling to `createOutputFilePath`'s directory so the JSONL and the audit
+ * output file share a parent — the audit file is `<agentId>.jsonl`, the
+ * pi-format session is `<timestamp>_<sessionId>.jsonl` (filename chosen by pi).
+ * Both live under `subagents/<parent-session-id>/`, which pi's session picker
+ * never recurses into, so they don't clutter the main session list.
+ */
+export function createSessionDir(cwd: string, sessionId: string): string {
+  const encoded = encodeCwd(cwd);
+  const home = process.env.HOME || process.env.USERPROFILE || tmpdir();
+  return join(home, ".pi", "agent", "sessions", `--${encoded}--`, "subagents", sessionId);
+}
+
 /** Minimal tool definition shape for serialization. */
 export interface ToolDefSnapshot {
   name: string;

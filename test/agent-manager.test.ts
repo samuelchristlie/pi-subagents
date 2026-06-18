@@ -6,6 +6,7 @@ import type { AgentRecord } from "../src/types.js";
 vi.mock("../src/agent-runner.js", () => ({
   runAgent: vi.fn(),
   resumeAgent: vi.fn(),
+  rehydrateAgent: vi.fn(),
 }));
 
 vi.mock("../src/worktree.js", () => ({
@@ -742,5 +743,276 @@ describe("AgentManager — runAgent rejection leaves the record visible with err
     expect(record.status).toBe("error");
     expect(record.error).toBe("boom");
     expect(record.completedAt).toBeGreaterThan(0);
+  });
+});
+
+// ─── persistence: sessionFilePath + configSnapshot capture ───────────
+// When a session is created with a sessionDir, runAgent produces a persisted
+// JSONL. The manager captures the resulting session.sessionFile onto the
+// record (for later rehydration) and snapshots the spawn config (model,
+// thinking, cwd, etc.) so rehydrate can rebuild the session without the
+// caller's original options.
+describe("AgentManager — persistence capture at spawn", () => {
+  let manager: AgentManager;
+  afterEach(() => manager?.dispose());
+
+  it("captures sessionFilePath from session.sessionFile on creation", async () => {
+    const sess = { ...mockSession(), sessionFile: "/path/to/session.jsonl" };
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "done", session: sess as any, aborted: false, steered: false,
+    });
+    manager = new AgentManager();
+
+    const id = manager.spawn(mockPi, mockCtx, "X", "p", {
+      description: "x",
+      isBackground: true,
+      sessionDir: "/some/dir",
+    });
+    // Drive onSessionCreated by awaiting the run — the manager's callback
+    // runs synchronously inside runAgent's invocation.
+    await manager.getRecord(id)!.promise;
+
+    expect(manager.getRecord(id)!.sessionFilePath).toBe("/path/to/session.jsonl");
+  });
+
+  it("snapshots spawn config (model, thinkingLevel, isolated, cwd, configCwd) on the record", async () => {
+    const sess = { ...mockSession(), sessionFile: "/p.jsonl" };
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "done", session: sess as any, aborted: false, steered: false,
+    });
+    manager = new AgentManager();
+
+    const model = { provider: "anthropic", id: "claude-haiku-4-5" } as any;
+    const id = manager.spawn(mockPi, mockCtx, "X", "p", {
+      description: "x",
+      isBackground: true,
+      model,
+      thinkingLevel: "high",
+      isolated: true,
+    });
+    await manager.getRecord(id)!.promise;
+
+    const snap = manager.getRecord(id)!.configSnapshot;
+    expect(snap).toBeDefined();
+    expect(snap!.resolvedModelKey).toBe("anthropic/claude-haiku-4-5");
+    expect(snap!.thinkingLevel).toBe("high");
+    expect(snap!.isolated).toBe(true);
+    // No worktree or custom cwd → cwd is undefined, configCwd is undefined
+    expect(snap!.cwd).toBeUndefined();
+    expect(snap!.configCwd).toBeUndefined();
+  });
+
+  it("snapshots caller-supplied cwd and derives configCwd from the parent", async () => {
+    const sess = { ...mockSession(), sessionFile: "/p.jsonl" };
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "done", session: sess as any, aborted: false, steered: false,
+    });
+    manager = new AgentManager();
+
+    const id = manager.spawn(mockPi, mockCtx, "X", "p", {
+      description: "x",
+      isBackground: true,
+      cwd: "/", // absolute and always exists
+    });
+    await manager.getRecord(id)!.promise;
+
+    const snap = manager.getRecord(id)!.configSnapshot;
+    expect(snap!.cwd).toBe("/");
+    expect(snap!.configCwd).toBe("/tmp"); // parent cwd
+  });
+});
+
+// ─── resume() rehydration: rebuild a session from disk ───────────────
+// Fast path: live session in memory. Slow path: session gone but JSONL on
+// disk → rehydrateAgent rebuilds it from the agent type + configSnapshot.
+describe("AgentManager — resume rehydration", () => {
+  let manager: AgentManager;
+  afterEach(() => manager?.dispose());
+
+  it("fast path: uses the live session when it is still in memory", async () => {
+    const sess = { ...mockSession() };
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "first", session: sess as any, aborted: false, steered: false,
+    });
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "X", "p", {
+      description: "x", isBackground: true,
+    });
+    await manager.getRecord(id)!.promise;
+
+    const { resumeAgent: resumeMock } = await import("../src/agent-runner.js");
+    vi.mocked(resumeMock).mockResolvedValue("second");
+
+    await manager.resume(id, "more", { ctx: mockCtx as any, pi: mockPi });
+
+    const { rehydrateAgent: rehydrateMock } = await import("../src/agent-runner.js");
+    expect(rehydrateMock).not.toHaveBeenCalled();
+    expect(resumeMock).toHaveBeenCalledWith(sess, "more", expect.anything());
+  });
+
+  it("slow path: rehydrates from sessionFilePath when session is gone", async () => {
+    const sess = { ...mockSession(), sessionFile: "/persisted/session.jsonl" };
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "first", session: sess as any, aborted: false, steered: false,
+    });
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "p", {
+      description: "x",
+      isBackground: true,
+      sessionDir: "/some/dir",
+      model: { provider: "anthropic", id: "claude-haiku-4-5" } as any,
+      thinkingLevel: "high",
+    });
+    await manager.getRecord(id)!.promise;
+
+    const record = manager.getRecord(id)!;
+    expect(record.sessionFilePath).toBe("/persisted/session.jsonl");
+
+    // Simulate cleanup: drop the in-memory session, keep the file path + snapshot.
+    record.session = undefined;
+
+    const { rehydrateAgent: rehydrateMock } = await import("../src/agent-runner.js");
+    const rehydrated = { ...mockSession() };
+    vi.mocked(rehydrateMock).mockResolvedValue(rehydrated as any);
+
+    const { resumeAgent: resumeMock } = await import("../src/agent-runner.js");
+    vi.mocked(resumeMock).mockResolvedValue("rehydrated-result");
+
+    await manager.resume(id, "continue", { ctx: mockCtx as any, pi: mockPi });
+
+    // rehydrateAgent was called with the persisted path + snapshot-derived config
+    expect(rehydrateMock).toHaveBeenCalledTimes(1);
+    // lastCall — mock.calls persists across tests in the same file
+    const [calledCtx, calledType, calledPath, calledOpts] = vi.mocked(rehydrateMock).mock.lastCall!;
+    expect(calledCtx).toBe(mockCtx);
+    expect(calledType).toBe("general-purpose");
+    expect(calledPath).toBe("/persisted/session.jsonl");
+    expect(calledOpts).toMatchObject({
+      agentId: id,
+      thinkingLevel: "high",
+    });
+
+    // The rehydrated session is now live on the record and resumeAgent was driven against it
+    expect(record.session).toBe(rehydrated);
+    expect(resumeMock).toHaveBeenCalledWith(rehydrated, "continue", expect.anything());
+    expect(record.status).toBe("completed");
+    expect(record.result).toBe("rehydrated-result");
+  });
+
+  it("slow path: resolves the model from configSnapshot via the registry", async () => {
+    const sess = { ...mockSession(), sessionFile: "/p.jsonl" };
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "first", session: sess as any, aborted: false, steered: false,
+    });
+    const ctxWithRegistry = {
+      ...mockCtx,
+      modelRegistry: { find: vi.fn(() => ({ provider: "anthropic", id: "claude-haiku-4-5" })) },
+    } as any;
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, ctxWithRegistry, "general-purpose", "p", {
+      description: "x",
+      isBackground: true,
+      model: { provider: "anthropic", id: "claude-haiku-4-5" } as any,
+    });
+    await manager.getRecord(id)!.promise;
+    manager.getRecord(id)!.session = undefined;
+
+    const { rehydrateAgent: rehydrateMock } = await import("../src/agent-runner.js");
+    vi.mocked(rehydrateMock).mockResolvedValue({ ...mockSession() } as any);
+    vi.mocked(await import("../src/agent-runner.js")).resumeAgent.mockResolvedValue("ok");
+
+    await manager.resume(id, "go", { ctx: ctxWithRegistry, pi: mockPi });
+
+    expect(ctxWithRegistry.modelRegistry.find).toHaveBeenCalledWith("anthropic", "claude-haiku-4-5");
+    const calledOpts = vi.mocked(rehydrateMock).mock.lastCall![3];
+    expect(calledOpts.model).toEqual({ provider: "anthropic", id: "claude-haiku-4-5" });
+  });
+
+  it("returns undefined when neither session nor sessionFilePath is available", async () => {
+    manager = new AgentManager();
+    const id = "never-spawned";
+    const result = await manager.resume(id, "p", { ctx: mockCtx as any, pi: mockPi });
+    expect(result).toBeUndefined();
+  });
+
+  it("returns undefined when sessionFilePath exists but no ctx/pi for rehydration", async () => {
+    manager = new AgentManager();
+    // Inject a synthetic record with a sessionFilePath but no live session.
+    const record: AgentRecord = {
+      id: "synthetic",
+      type: "general-purpose",
+      description: "x",
+      status: "completed",
+      toolUses: 0,
+      startedAt: Date.now(),
+      lifetimeUsage: { input: 0, output: 0, cacheWrite: 0 },
+      compactionCount: 0,
+      sessionFilePath: "/persisted/session.jsonl",
+    };
+    (manager as any).agents.set("synthetic", record);
+
+    const result = await manager.resume("synthetic", "p");
+    expect(result).toBeUndefined();
+  });
+
+  it("slow path: surfaces rehydration failures as status='error' on the record", async () => {
+    manager = new AgentManager();
+    const record: AgentRecord = {
+      id: "broken",
+      type: "general-purpose",
+      description: "x",
+      status: "completed",
+      toolUses: 0,
+      startedAt: Date.now(),
+      lifetimeUsage: { input: 0, output: 0, cacheWrite: 0 },
+      compactionCount: 0,
+      sessionFilePath: "/persisted/missing.jsonl",
+    };
+    (manager as any).agents.set("broken", record);
+
+    const { rehydrateAgent: rehydrateMock } = await import("../src/agent-runner.js");
+    vi.mocked(rehydrateMock).mockRejectedValue(new Error("file not found"));
+
+    const result = await manager.resume("broken", "p", { ctx: mockCtx as any, pi: mockPi });
+
+    expect(result).toBeDefined();
+    expect(result!.status).toBe("error");
+    expect(result!.error).toContain("file not found");
+  });
+});
+
+// ─── cleanup preserves persisted JSONLs on disk ──────────────────────
+// removeRecord / clearCompleted dispose the in-memory session but never touch
+// the file at sessionFilePath — so resume() can rehydrate later. dispose()
+// (pi's API) is purely in-memory cleanup; it does not unlink files.
+describe("AgentManager — cleanup preserves persisted session files", () => {
+  let manager: AgentManager;
+  afterEach(() => manager?.dispose());
+
+  it("removeRecord disposes the in-memory session but keeps sessionFilePath on the record", async () => {
+    const disposeSpy = vi.fn();
+    const sess = { ...mockSession(), dispose: disposeSpy, sessionFile: "/keep.jsonl" };
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "done", session: sess as any, aborted: false, steered: false,
+    });
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "X", "p", {
+      description: "x", isBackground: true, sessionDir: "/d",
+    });
+    const record = manager.getRecord(id)!;
+    await record.promise;
+
+    expect(record.sessionFilePath).toBe("/keep.jsonl");
+
+    // clearCompleted triggers removeRecord for the completed record
+    manager.clearCompleted();
+
+    expect(disposeSpy).toHaveBeenCalledOnce();
+    expect(manager.getRecord(id)).toBeUndefined();
+    // The record object still holds sessionFilePath — the manager dropped its
+    // map entry, but anything that captured the record (e.g. a history log)
+    // still sees where the JSONL lives.
+    expect(record.sessionFilePath).toBe("/keep.jsonl");
+    expect(record.session).toBeUndefined();
   });
 });

@@ -7,6 +7,8 @@ const {
   loaderExtensionsRef,
   getAgentDir,
   sessionManagerInMemory,
+  sessionManagerCreate,
+  sessionManagerOpen,
   settingsManagerCreate,
 } = vi.hoisted(() => ({
   createAgentSession: vi.fn(),
@@ -20,6 +22,8 @@ const {
   },
   getAgentDir: vi.fn(() => "/mock/agent-dir"),
   sessionManagerInMemory: vi.fn(() => ({ kind: "memory-session-manager" })),
+  sessionManagerCreate: vi.fn((_cwd: string, _sessionDir?: string) => ({ kind: "create-session-manager" })),
+  sessionManagerOpen: vi.fn((_path: string) => ({ kind: "open-session-manager" })),
   settingsManagerCreate: vi.fn(() => ({ kind: "settings-manager" })),
 }));
 
@@ -53,7 +57,7 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
     }
   },
   getAgentDir,
-  SessionManager: { inMemory: sessionManagerInMemory },
+  SessionManager: { inMemory: sessionManagerInMemory, create: sessionManagerCreate, open: sessionManagerOpen },
   SettingsManager: { create: settingsManagerCreate },
 }));
 
@@ -149,6 +153,8 @@ beforeEach(() => {
   defaultResourceLoaderCtor.mockClear();
   getAgentDir.mockClear();
   sessionManagerInMemory.mockClear();
+  sessionManagerCreate.mockClear();
+  sessionManagerOpen.mockClear();
   settingsManagerCreate.mockClear();
   loaderExtensionsRef.current = { extensions: [], errors: [], runtime: {} };
 });
@@ -244,6 +250,87 @@ describe("agent-runner final output capture", () => {
     await runAgent(ctx, "Explore", "go", { pi, agentId: "a1b2c3d4e5f6" });
 
     expect(session.setSessionName).toHaveBeenCalledWith("Explore#a1b2c3d4");
+  });
+});
+
+// ─── persisted session JSONL (inMemory vs SessionManager.create) ──────
+// When `sessionDir` is supplied, runAgent builds a persisted pi-format
+// session via SessionManager.create(cwd, sessionDir) instead of the
+// in-memory default. The session is then reloadable via SessionManager.open.
+describe("agent-runner persisted session creation", () => {
+  it("defaults to inMemory when sessionDir is omitted (backward compatible)", async () => {
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi });
+
+    expect(sessionManagerInMemory).toHaveBeenCalledWith("/tmp");
+    expect(sessionManagerCreate).not.toHaveBeenCalled();
+  });
+
+  it("uses SessionManager.create(cwd, sessionDir) when sessionDir is provided", async () => {
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi, sessionDir: "/some/dir" });
+
+    expect(sessionManagerCreate).toHaveBeenCalledWith("/tmp", "/some/dir");
+    expect(sessionManagerInMemory).not.toHaveBeenCalled();
+  });
+
+  it("passes the sessionManager from create() through to createAgentSession", async () => {
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi, sessionDir: "/some/dir" });
+
+    expect(createAgentSession).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionManager: { kind: "create-session-manager" } }),
+    );
+  });
+});
+
+// ─── rehydrateAgent: rebuild a session from a persisted JSONL ────────
+// The slow path for manager.resume() when the live session is gone. Opens
+// the JSONL via SessionManager.open and reconstructs the full session
+// config from the agent type — same construction path as runAgent, just
+// with a different sessionManager.
+describe("rehydrateAgent", () => {
+  it("opens the JSONL via SessionManager.open(filePath)", async () => {
+    const { session } = createSession("REHYDRATED");
+    createAgentSession.mockResolvedValue({ session });
+
+    const { rehydrateAgent } = await import("../src/agent-runner.js");
+    const result = await rehydrateAgent(ctx, "Explore", "/path/to/session.jsonl", { pi });
+
+    expect(sessionManagerOpen).toHaveBeenCalledWith("/path/to/session.jsonl");
+    expect(sessionManagerInMemory).not.toHaveBeenCalled();
+    expect(sessionManagerCreate).not.toHaveBeenCalled();
+    // The session is returned for the caller (manager) to wire up
+    expect(result).toBe(session);
+  });
+
+  it("binds extensions and sets the session name like a fresh spawn", async () => {
+    const { session } = createSession("REHYDRATED");
+    createAgentSession.mockResolvedValue({ session });
+
+    const { rehydrateAgent } = await import("../src/agent-runner.js");
+    await rehydrateAgent(ctx, "Explore", "/path.jsonl", { pi, agentId: "a1b2c3d4e5f6" });
+
+    expect(session.setSessionName).toHaveBeenCalledWith("Explore#a1b2c3d4");
+    expect(session.bindExtensions).toHaveBeenCalledTimes(1);
+  });
+
+  it("passes the opened sessionManager through to createAgentSession", async () => {
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    const { rehydrateAgent } = await import("../src/agent-runner.js");
+    await rehydrateAgent(ctx, "Explore", "/path.jsonl", { pi });
+
+    expect(createAgentSession).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionManager: { kind: "open-session-manager" } }),
+    );
   });
 });
 

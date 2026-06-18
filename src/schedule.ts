@@ -20,6 +20,7 @@ import { Cron } from "croner";
 import { nanoid } from "nanoid";
 import type { AgentManager } from "./agent-manager.js";
 import { resolveModel } from "./model-resolver.js";
+import { createSessionDir } from "./output-file.js";
 import type { ScheduleStore } from "./schedule-store.js";
 import type { IsolationMode, ScheduledSubagent, SubagentType, ThinkingLevel } from "./types.js";
 
@@ -247,6 +248,7 @@ export class SubagentScheduler {
         isolated: job.isolated,
         thinkingLevel: job.thinking,
         isolation: job.isolation,
+        sessionDir: createSessionDir(ctx.cwd, ctx.sessionManager.getSessionId()),
       });
     } catch (err) {
       const error = err instanceof Error ? err.message : String(err);

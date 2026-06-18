@@ -24,7 +24,7 @@ import { isModelInScope, readEnabledModels, resolveEnabledModels } from "./enabl
 import { GroupJoinManager } from "./group-join.js";
 import { resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
-import { appendSystemSnapshot, createOutputFilePath, streamToOutputFile, writeInitialEntry } from "./output-file.js";
+import { appendSystemSnapshot, createOutputFilePath, createSessionDir, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
@@ -1108,10 +1108,13 @@ Terse command-style prompts produce shallow, generic work.
         if (!existing) {
           return textResult(`Agent not found: "${params.resume}". It may have been cleaned up.`);
         }
-        if (!existing.session) {
-          return textResult(`Agent "${params.resume}" has no active session to resume.`);
+        // Fast path: live in-memory session. Slow path: rehydrate from disk
+        // via sessionFilePath (manager.resume handles it). If neither, the
+        // record exists but was never persisted (e.g. older in-memory spawn).
+        if (!existing.session && !existing.sessionFilePath) {
+          return textResult(`Agent "${params.resume}" has no active or persisted session to resume.`);
         }
-        const record = await manager.resume(params.resume, params.prompt, signal);
+        const record = await manager.resume(params.resume, params.prompt, { ctx, pi, signal });
         if (!record) {
           return textResult(`Failed to resume agent "${params.resume}".`);
         }
@@ -1151,6 +1154,7 @@ Terse command-style prompts produce shallow, generic work.
             isBackground: true,
             isolation,
             invocation: agentInvocation,
+            sessionDir: createSessionDir(ctx.cwd, ctx.sessionManager.getSessionId()),
             ...bgCallbacks,
           });
         } catch (err) {
@@ -1273,6 +1277,7 @@ Terse command-style prompts produce shallow, generic work.
           thinkingLevel: thinking,
           isolation,
           invocation: agentInvocation,
+          sessionDir: createSessionDir(ctx.cwd, ctx.sessionManager.getSessionId()),
           signal,
           ...fgCallbacks,
         });

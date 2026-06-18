@@ -10,6 +10,7 @@
  */
 
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
+import { createSessionDir } from "./output-file.js";
 
 /** Minimal event bus interface needed by the RPC handlers. */
 export interface EventBus {
@@ -106,6 +107,16 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
           throw new Error(resolved);
         }
         normalizedOptions = { ...normalizedOptions, model: resolved };
+      }
+
+      // Inject sessionDir so RPC spawns persist to disk too — same as the
+      // in-process Agent tool path. The caller can still override by passing
+      // its own sessionDir explicitly. Skipped silently when ctx.sessionManager
+      // isn't available (defensive — older ctx shapes).
+      const ctxAny = ctx as { cwd: string; sessionManager?: { getSessionId?: () => string } };
+      const sessionId = ctxAny.sessionManager?.getSessionId?.();
+      if (sessionId && normalizedOptions.sessionDir === undefined) {
+        normalizedOptions = { ...normalizedOptions, sessionDir: createSessionDir(ctxAny.cwd, sessionId) };
       }
 
       return { id: manager.spawn(pi, ctx, type, prompt, normalizedOptions) };

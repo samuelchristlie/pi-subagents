@@ -11,7 +11,7 @@ import { statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
+import { rehydrateAgent, resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
 import type { AgentInvocation, AgentRecord, IsolationMode, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage } from "./usage.js";
 import { cleanupWorktree, createWorktree, pruneWorktrees, } from "./worktree.js";
@@ -23,6 +23,27 @@ export type CompactionInfo = { reason: "manual" | "threshold" | "overflow"; toke
 
 /** Default max concurrent background agents. */
 const DEFAULT_MAX_CONCURRENT = 4;
+
+/**
+ * Resolve a Model from a snapshot's `resolvedModelKey` ("provider/modelId")
+ * using the parent session's model registry. Returns undefined when the model
+ * is no longer available (or the registry is missing) — `runAgent` then falls
+ * back to the agent config / parent model via `resolveDefaultModel`, same as
+ * a fresh spawn.
+ */
+function resolveModelFromSnapshot(
+  ctx: ExtensionContext,
+  snapshot: { resolvedModelKey?: string } | undefined,
+): Model<any> | undefined {
+  const key = snapshot?.resolvedModelKey;
+  if (!key) return undefined;
+  const slash = key.indexOf("/");
+  if (slash === -1) return undefined;
+  const provider = key.slice(0, slash);
+  const modelId = key.slice(slash + 1);
+  const registry = (ctx as { modelRegistry?: { find?: (provider: string, modelId: string) => Model<any> | undefined } }).modelRegistry;
+  return registry?.find?.(provider, modelId);
+}
 
 /**
  * Validate a caller-supplied SpawnOptions.cwd. `undefined`/`null` mean "unset"
@@ -79,6 +100,12 @@ interface SpawnOptions {
    * branch lands in that repo.
    */
   cwd?: string;
+  /**
+   * Directory for the persisted pi-format session JSONL. When set, the session
+   * is written to disk and can be rehydrated later by `resume()`. The
+   * directory is created if missing. When omitted, the session is in-memory.
+   */
+  sessionDir?: string;
   /** Resolved invocation snapshot captured for UI display. */
   invocation?: AgentInvocation;
   /** Parent abort signal — when aborted, the subagent is also stopped. */
@@ -227,6 +254,18 @@ export class AgentManager {
     record.status = "running";
     record.startedAt = Date.now();
     if (options.isBackground) this.runningBackground++;
+
+    // Capture the spawn-time config so resume() can rehydrate the session later
+    // after the in-memory reference is cleaned up. `cwd` and `configCwd` are
+    // resolved post-worktree (worktreeCwd / customCwd) to match exactly what
+    // runAgent receives.
+    record.configSnapshot = {
+      resolvedModelKey: options.model ? `${options.model.provider}/${options.model.id}` : undefined,
+      thinkingLevel: options.thinkingLevel,
+      isolated: options.isolated,
+      cwd: worktreeCwd ?? customCwd,
+      configCwd: customCwd !== undefined ? ctx.cwd : undefined,
+    };
     this.onStart?.(record);
 
     // Wire parent abort signal to stop the subagent when the parent is interrupted
@@ -253,6 +292,7 @@ export class AgentManager {
       // (incl. relative extension paths and memory) inside the worktree copy.
       cwd: worktreeCwd ?? customCwd,
       configCwd: customCwd !== undefined ? ctx.cwd : undefined,
+      sessionDir: options.sessionDir,
       signal: record.abortController!.signal,
       onToolActivity: (activity) => {
         if (activity.type === "end") record.toolUses++;
@@ -271,6 +311,10 @@ export class AgentManager {
       },
       onSessionCreated: (session) => {
         record.session = session;
+        // Capture the persisted session file path for rehydration. Only set
+        // when the session is persisted (sessionDir was supplied via runAgent
+        // options); in-memory sessions return undefined here.
+        record.sessionFilePath = session.sessionFile;
         // Flush any steers that arrived before the session was ready
         if (record.pendingSteers?.length) {
           for (const msg of record.pendingSteers) {
@@ -288,6 +332,12 @@ export class AgentManager {
         }
         record.result = responseText;
         record.session = session;
+        // Fallback capture of sessionFilePath for callers (e.g. mocked tests,
+        // or any future code path) that don't fire onSessionCreated. The
+        // primary capture happens in the onSessionCreated callback below —
+        // this `??=` is a no-op when that already ran. Important for resume()
+        // rehydration, which keys off sessionFilePath.
+        record.sessionFilePath ??= session?.sessionFile;
         record.completedAt ??= Date.now();
 
         detach();
@@ -391,14 +441,55 @@ export class AgentManager {
 
   /**
    * Resume an existing agent session with a new prompt.
+   *
+   * Two paths:
+   *   1. Fast: the live `AgentSession` is still in memory — prompt it directly.
+   *   2. Slow: the in-memory session was cleaned up (10-min timer or
+   *      clearCompleted), but the persisted JSONL is still on disk. Rehydrate
+   *      via `rehydrateAgent()` — needs `ctx` + `pi` so the agent config can be
+   *      reconstructed (loader, tools, prompt, model). If neither path applies,
+   *      returns undefined.
    */
   async resume(
     id: string,
     prompt: string,
-    signal?: AbortSignal,
+    options: {
+      ctx?: ExtensionContext;
+      pi?: ExtensionAPI;
+      signal?: AbortSignal;
+    } = {},
   ): Promise<AgentRecord | undefined> {
     const record = this.agents.get(id);
-    if (!record?.session) return undefined;
+    if (!record) return undefined;
+
+    // Slow path: rehydrate from disk before resuming.
+    if (!record.session && record.sessionFilePath && record.type) {
+      const { ctx, pi } = options;
+      if (!ctx || !pi) {
+        // Caller didn't pass rehydration context — can't rebuild the session.
+        return undefined;
+      }
+      try {
+        const model = resolveModelFromSnapshot(ctx, record.configSnapshot);
+        const session = await rehydrateAgent(ctx, record.type, record.sessionFilePath, {
+          pi,
+          agentId: id,
+          model,
+          thinkingLevel: record.configSnapshot?.thinkingLevel,
+          isolated: record.configSnapshot?.isolated,
+          cwd: record.configSnapshot?.cwd,
+          configCwd: record.configSnapshot?.configCwd,
+        });
+        record.session = session;
+      } catch (err) {
+        record.status = "error";
+        record.error = `Failed to resume from disk: ${err instanceof Error ? err.message : String(err)}`;
+        record.completedAt = Date.now();
+        return record;
+      }
+    }
+
+    if (!record.session) return undefined;
 
     record.status = "running";
     record.startedAt = Date.now();
@@ -418,7 +509,7 @@ export class AgentManager {
           record.compactionCount++;
           this.onCompact?.(record, info);
         },
-        signal,
+        signal: options.signal,
       });
       record.status = "completed";
       record.result = responseText;
@@ -461,7 +552,16 @@ export class AgentManager {
     return true;
   }
 
-  /** Dispose a record's session and remove it from the map. */
+  /**
+   * Dispose a record's in-memory session and remove the record from the map.
+   *
+   * IMPORTANT: this does NOT delete the persisted JSONL on disk. `dispose()` is
+   * purely in-memory cleanup (aborts, unsubscribes, invalidates extension ctx).
+   * The session file at `record.sessionFilePath` stays behind so a later
+   * `resume()` can rehydrate from it. This is the key behavior change vs. the
+   * pre-persistence era: cleanup used to be destructive because there was no
+   * on-disk state to preserve.
+   */
   private removeRecord(id: string, record: AgentRecord): void {
     record.session?.dispose?.();
     record.session = undefined;
@@ -479,7 +579,8 @@ export class AgentManager {
 
   /**
    * Remove all completed/stopped/errored records immediately.
-   * Called on session start/switch so tasks from a prior session don't persist.
+   * Called on session start/switch so tasks from a prior session don't persist
+   * *in memory* — but persisted JSONLs stay on disk for later rehydration.
    */
   clearCompleted(): void {
     for (const [id, record] of this.agents) {
