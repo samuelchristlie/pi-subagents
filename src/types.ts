@@ -144,6 +144,26 @@ export interface AgentConfigSnapshot {
   configCwd?: string;
 }
 
+/**
+ * Rehydration metadata persisted inside the session JSONL as a `subagent:config`
+ * custom_message entry. Lets `resumeFromDisk()` rebuild an `AgentRecord` purely
+ * from the JSONL after the in-memory `AgentRecord` is gone (cleanup timer or
+ * `clearCompleted()`).
+ *
+ * This is the on-disk twin of `AgentConfigSnapshot` plus the two extra fields a
+ * rehydrate needs (`type`, `originalPrompt`) — together they reconstruct the
+ * full spawn-time state. Mirrors pi-main's pattern of embedding all metadata
+ * in the session file (no sidecar map).
+ */
+export interface SubagentSessionConfig {
+  /** Agent type — drives loader/tools/prompt reconstruction in buildSessionDeps. */
+  type: SubagentType;
+  /** Original task instruction, for compaction re-injection on resume. */
+  originalPrompt: string;
+  /** Spawn-time config overrides (model, thinking, cwd, etc.). */
+  configSnapshot: AgentConfigSnapshot;
+}
+
 export interface AgentInvocation {
   /** Short display name, e.g. "haiku" — only set when different from parent. */
   modelName?: string;

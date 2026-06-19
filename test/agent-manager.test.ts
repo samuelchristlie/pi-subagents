@@ -1,5 +1,5 @@
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agent-manager.js";
 import type { AgentRecord } from "../src/types.js";
 
@@ -7,6 +7,7 @@ vi.mock("../src/agent-runner.js", () => ({
   runAgent: vi.fn(),
   resumeAgent: vi.fn(),
   rehydrateAgent: vi.fn(),
+  readSubagentMetadata: vi.fn(),
 }));
 
 vi.mock("../src/worktree.js", () => ({
@@ -1014,5 +1015,166 @@ describe("AgentManager — cleanup preserves persisted session files", () => {
     // still sees where the JSONL lives.
     expect(record.sessionFilePath).toBe("/keep.jsonl");
     expect(record.session).toBeUndefined();
+  });
+});
+
+// ─── resumeFromDisk: rebuild an agent purely from a persisted JSONL ───
+// The disk-only counterpart to resume() — usable after the in-memory map is
+// gone (cleanup timer, clearCompleted, fresh process). Reads the
+// subagent:config metadata, rebuilds a record, rehydrates the session, and
+// drives the prompt. The rebuilt record is registered so later resume(id)
+// calls take the fast path.
+describe("AgentManager — resumeFromDisk", () => {
+  let manager: AgentManager;
+  afterEach(() => manager?.dispose());
+
+  async function importMocks() {
+    const mod = await import("../src/agent-runner.js");
+    return {
+      readSubagentMetadata: vi.mocked(mod.readSubagentMetadata),
+      rehydrateAgent: vi.mocked(mod.rehydrateAgent),
+      resumeAgent: vi.mocked(mod.resumeAgent),
+    };
+  }
+
+  beforeEach(async () => {
+    // Mocks accumulate calls across describe blocks in this file — clear so
+    // per-test call-count and lastCall assertions are isolated.
+    const m = await importMocks();
+    m.readSubagentMetadata.mockClear();
+    m.readSubagentMetadata.mockReset();
+    m.rehydrateAgent.mockClear();
+    m.rehydrateAgent.mockReset();
+    m.resumeAgent.mockClear();
+    m.resumeAgent.mockReset();
+  });
+
+  it("reads metadata, rebuilds a record, rehydrates, and drives the prompt", async () => {
+    const { readSubagentMetadata, rehydrateAgent, resumeAgent } = await importMocks();
+    readSubagentMetadata.mockResolvedValue({
+      type: "Explore",
+      originalPrompt: "the original task",
+      configSnapshot: { resolvedModelKey: "anthropic/claude-haiku-4-5", thinkingLevel: "high" },
+    });
+    const rehydrated = { ...mockSession() };
+    rehydrateAgent.mockResolvedValue(rehydrated as any);
+    resumeAgent.mockResolvedValue("rehydrated-result");
+
+    manager = new AgentManager();
+    const result = await manager.resumeFromDisk("/persisted/session.jsonl", "continue", {
+      ctx: mockCtx, pi: mockPi,
+    });
+
+    expect(result).toBeDefined();
+    expect(result!.status).toBe("completed");
+    expect(result!.result).toBe("rehydrated-result");
+    expect(result!.type).toBe("Explore");
+    expect(result!.originalPrompt).toBe("the original task");
+    expect(result!.description).toBe("the original task".slice(0, 80));
+    expect(result!.sessionFilePath).toBe("/persisted/session.jsonl");
+
+    // Metadata was read from the right file.
+    expect(readSubagentMetadata).toHaveBeenCalledWith("/persisted/session.jsonl");
+    // rehydrateAgent received the path + persistConfig (so on-disk metadata stays current).
+    expect(rehydrateAgent).toHaveBeenCalledTimes(1);
+    const [, , , opts] = rehydrateAgent.mock.lastCall! as any[];
+    expect(opts).toMatchObject({
+      agentId: result!.id,
+      thinkingLevel: "high",
+      persistConfig: { type: "Explore", originalPrompt: "the original task" },
+    });
+    // resumeAgent was driven against the rehydrated session.
+    expect(resumeAgent).toHaveBeenCalledWith(rehydrated, "continue", expect.anything());
+
+    // The rebuilt record is registered in the map — a subsequent resume() takes the fast path.
+    expect(manager.getRecord(result!.id)).toBe(result);
+  });
+
+  it("returns undefined when the JSONL has no subagent:config entry", async () => {
+    const { readSubagentMetadata, rehydrateAgent } = await importMocks();
+    readSubagentMetadata.mockResolvedValue(undefined);
+
+    manager = new AgentManager();
+    const result = await manager.resumeFromDisk("/persisted/old.jsonl", "go", {
+      ctx: mockCtx, pi: mockPi,
+    });
+
+    expect(result).toBeUndefined();
+    expect(rehydrateAgent).not.toHaveBeenCalled();
+    // No record registered.
+    expect(manager.listAgents()).toEqual([]);
+  });
+
+  it("resolves the model from configSnapshot via the registry and passes it to rehydrate", async () => {
+    const { readSubagentMetadata, rehydrateAgent, resumeAgent } = await importMocks();
+    readSubagentMetadata.mockResolvedValue({
+      type: "general-purpose",
+      originalPrompt: "task",
+      configSnapshot: { resolvedModelKey: "anthropic/claude-haiku-4-5" },
+    });
+    rehydrateAgent.mockResolvedValue({ ...mockSession() } as any);
+    resumeAgent.mockResolvedValue("ok");
+
+    const ctxWithRegistry = {
+      ...mockCtx,
+      modelRegistry: { find: vi.fn(() => ({ provider: "anthropic", id: "claude-haiku-4-5" })) },
+    } as any;
+    manager = new AgentManager();
+    await manager.resumeFromDisk("/p.jsonl", "go", { ctx: ctxWithRegistry, pi: mockPi });
+
+    expect(ctxWithRegistry.modelRegistry.find).toHaveBeenCalledWith("anthropic", "claude-haiku-4-5");
+    const opts = rehydrateAgent.mock.lastCall![3] as any;
+    expect(opts.model).toEqual({ provider: "anthropic", id: "claude-haiku-4-5" });
+  });
+
+  it("surfaces rehydration failures as status='error' on the record", async () => {
+    const { readSubagentMetadata, rehydrateAgent } = await importMocks();
+    readSubagentMetadata.mockResolvedValue({
+      type: "Explore", originalPrompt: "task", configSnapshot: {},
+    });
+    rehydrateAgent.mockRejectedValue(new Error("corrupt jsonl"));
+
+    manager = new AgentManager();
+    const result = await manager.resumeFromDisk("/p.jsonl", "go", { ctx: mockCtx, pi: mockPi });
+
+    expect(result).toBeDefined();
+    expect(result!.status).toBe("error");
+    expect(result!.error).toContain("corrupt jsonl");
+    expect(result!.completedAt).toBeGreaterThan(0);
+    // The errored record stays in the map so the caller can inspect it.
+    expect(manager.getRecord(result!.id)).toBe(result);
+  });
+
+  it("surfaces prompt failures as status='error' (session already rehydrated)", async () => {
+    const { readSubagentMetadata, rehydrateAgent, resumeAgent } = await importMocks();
+    readSubagentMetadata.mockResolvedValue({
+      type: "Explore", originalPrompt: "task", configSnapshot: {},
+    });
+    rehydrateAgent.mockResolvedValue({ ...mockSession() } as any);
+    resumeAgent.mockRejectedValue(new Error("model overloaded"));
+
+    manager = new AgentManager();
+    const result = await manager.resumeFromDisk("/p.jsonl", "go", { ctx: mockCtx, pi: mockPi });
+
+    expect(result!.status).toBe("error");
+    expect(result!.error).toContain("model overloaded");
+  });
+
+  it("description is truncated to 80 chars from the original prompt", async () => {
+    const { readSubagentMetadata, rehydrateAgent, resumeAgent } = await importMocks();
+    const longPrompt = "x".repeat(200);
+    readSubagentMetadata.mockResolvedValue({
+      type: "Explore", originalPrompt: longPrompt, configSnapshot: {},
+    });
+    rehydrateAgent.mockResolvedValue({ ...mockSession() } as any);
+    resumeAgent.mockResolvedValue("ok");
+
+    manager = new AgentManager();
+    const result = await manager.resumeFromDisk("/p.jsonl", "go", { ctx: mockCtx, pi: mockPi });
+
+    expect(result!.description).toHaveLength(80);
+    expect(result!.description).toBe("x".repeat(80));
+    // originalPrompt is preserved untruncated.
+    expect(result!.originalPrompt).toBe(longPrompt);
   });
 });

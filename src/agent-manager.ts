@@ -11,7 +11,7 @@ import { statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { rehydrateAgent, resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
+import { readSubagentMetadata, rehydrateAgent, resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
 import type { AgentInvocation, AgentRecord, IsolationMode, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage } from "./usage.js";
 import { cleanupWorktree, createWorktree, pruneWorktrees, } from "./worktree.js";
@@ -500,6 +500,97 @@ export class AgentManager {
 
     try {
       const responseText = await resumeAgent(record.session, prompt, {
+        onToolActivity: (activity) => {
+          if (activity.type === "end") record.toolUses++;
+        },
+        onAssistantUsage: (usage) => {
+          addUsage(record.lifetimeUsage, usage);
+        },
+        onCompaction: (info) => {
+          record.compactionCount++;
+          this.onCompact?.(record, info);
+        },
+        signal: options.signal,
+        originalPrompt: record.originalPrompt,
+      });
+      record.status = "completed";
+      record.result = responseText;
+      record.completedAt = Date.now();
+    } catch (err) {
+      record.status = "error";
+      record.error = err instanceof Error ? err.message : String(err);
+      record.completedAt = Date.now();
+    }
+
+    return record;
+  }
+
+  /**
+   * Resume a subagent session purely from its persisted JSONL — no live
+   * `AgentRecord` required. This is the disk-only counterpart to `resume()`,
+   * usable after the in-memory map was cleared (cleanup timer, `clearCompleted()`,
+   * or a fresh process) as long as the session file is still on disk.
+   *
+   * Rehydration metadata (`type`, `originalPrompt`, `configSnapshot`) is read
+   * from the `subagent:config` entry embedded in the JSONL, so no sidecar map
+   * file is needed. Returns `undefined` when the file has no such entry (old
+   * JSONL or non-subagent file) or when `ctx`/`pi` are missing. On success the
+   * rebuilt record is registered in the map (so subsequent `resume(id, ...)`
+   * calls take the fast path) and the prompt is driven to completion.
+   */
+  async resumeFromDisk(
+    sessionFilePath: string,
+    prompt: string,
+    options: { ctx: ExtensionContext; pi: ExtensionAPI; signal?: AbortSignal },
+  ): Promise<AgentRecord | undefined> {
+    const { ctx, pi } = options;
+
+    const meta = await readSubagentMetadata(sessionFilePath);
+    if (!meta) return undefined;
+
+    const id = randomUUID().slice(0, 17);
+    const abortController = new AbortController();
+    const record: AgentRecord = {
+      id,
+      type: meta.type,
+      description: meta.originalPrompt.slice(0, 80),
+      status: "running",
+      toolUses: 0,
+      startedAt: Date.now(),
+      abortController,
+      lifetimeUsage: { input: 0, output: 0, cacheWrite: 0 },
+      compactionCount: 0,
+      originalPrompt: meta.originalPrompt,
+      configSnapshot: meta.configSnapshot,
+      sessionFilePath,
+    };
+    this.agents.set(id, record);
+
+    let session: AgentSession;
+    try {
+      const model = resolveModelFromSnapshot(ctx, meta.configSnapshot);
+      // `persistConfig` re-writes the `subagent:config` entry so the metadata
+      // stays current on disk across resumes (latest-wins on read).
+      session = await rehydrateAgent(ctx, meta.type, sessionFilePath, {
+        pi,
+        agentId: id,
+        model,
+        thinkingLevel: meta.configSnapshot?.thinkingLevel,
+        isolated: meta.configSnapshot?.isolated,
+        cwd: meta.configSnapshot?.cwd,
+        configCwd: meta.configSnapshot?.configCwd,
+        persistConfig: meta,
+      });
+      record.session = session;
+    } catch (err) {
+      record.status = "error";
+      record.error = `Failed to resume from disk: ${err instanceof Error ? err.message : String(err)}`;
+      record.completedAt = Date.now();
+      return record;
+    }
+
+    try {
+      const responseText = await resumeAgent(session, prompt, {
         onToolActivity: (activity) => {
           if (activity.type === "end") record.toolUses++;
         },

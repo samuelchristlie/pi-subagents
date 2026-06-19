@@ -1,5 +1,7 @@
-import { homedir } from "node:os";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const {
   createAgentSession,
@@ -294,7 +296,268 @@ describe("agent-runner persisted session creation", () => {
   });
 });
 
-// ─── rehydrateAgent: rebuild a session from a persisted JSONL ────────
+// ─── subagent:config persistence (runAgent writes rehydration metadata) ─
+// When sessionDir is supplied, runAgent embeds a `subagent:config` entry in
+// the JSONL right after bindExtensions — so readSubagentMetadata can rebuild
+// the agent from disk alone after the in-memory record is gone. In-memory
+// runs (no sessionDir) skip the write.
+describe("runAgent subagent:config persistence", () => {
+  it("writes a subagent:config entry when sessionDir is supplied", async () => {
+    const { session, mockSessionManager } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    const model = { provider: "anthropic", id: "claude-haiku-4-5" } as any;
+    await runAgent(ctx, "Explore", "do thing", {
+      pi,
+      sessionDir: "/some/dir",
+      model,
+      thinkingLevel: "high",
+      isolated: true,
+      cwd: "/work",
+      configCwd: "/cfg",
+    });
+
+    expect(mockSessionManager.appendCustomMessageEntry).toHaveBeenCalledWith(
+      "subagent:config",
+      "",
+      false,
+      expect.objectContaining({
+        type: "Explore",
+        originalPrompt: "do thing",
+        configSnapshot: expect.objectContaining({
+          resolvedModelKey: "anthropic/claude-haiku-4-5",
+          thinkingLevel: "high",
+          isolated: true,
+          cwd: "/work",
+          configCwd: "/cfg",
+        }),
+      }),
+    );
+  });
+
+  it("does NOT write subagent:config for in-memory sessions (no sessionDir)", async () => {
+    const { session, mockSessionManager } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi });
+
+    const configCalls = vi.mocked(mockSessionManager.appendCustomMessageEntry).mock.calls.filter(
+      ([type]) => type === "subagent:config",
+    );
+    expect(configCalls).toHaveLength(0);
+  });
+
+  it("omits resolvedModelKey from the snapshot when no model was supplied", async () => {
+    const { session, mockSessionManager } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi, sessionDir: "/d" });
+
+    const call = vi.mocked(mockSessionManager.appendCustomMessageEntry).mock.calls.find(
+      ([type]) => type === "subagent:config",
+    );
+    expect(call).toBeDefined();
+    const details = call![3] as any;
+    expect(details.configSnapshot.resolvedModelKey).toBeUndefined();
+  });
+});
+
+// ─── rehydrateAgent re-writes subagent:config when persistConfig is set ─
+describe("rehydrateAgent subagent:config re-write", () => {
+  it("re-writes the subagent:config entry when persistConfig is supplied", async () => {
+    const { session, mockSessionManager } = createSession("REHYDRATED");
+    createAgentSession.mockResolvedValue({ session });
+
+    const { rehydrateAgent } = await import("../src/agent-runner.js");
+    await rehydrateAgent(ctx, "Explore", "/path.jsonl", {
+      pi,
+      persistConfig: {
+        type: "Explore",
+        originalPrompt: "the task",
+        configSnapshot: { resolvedModelKey: "anthropic/claude-haiku-4-5" },
+      },
+    });
+
+    expect(mockSessionManager.appendCustomMessageEntry).toHaveBeenCalledWith(
+      "subagent:config",
+      "",
+      false,
+      expect.objectContaining({ type: "Explore", originalPrompt: "the task" }),
+    );
+  });
+
+  it("does NOT write subagent:config when persistConfig is omitted", async () => {
+    const { session, mockSessionManager } = createSession("REHYDRATED");
+    createAgentSession.mockResolvedValue({ session });
+
+    const { rehydrateAgent } = await import("../src/agent-runner.js");
+    await rehydrateAgent(ctx, "Explore", "/path.jsonl", { pi });
+
+    const configCalls = vi.mocked(mockSessionManager.appendCustomMessageEntry).mock.calls.filter(
+      ([type]) => type === "subagent:config",
+    );
+    expect(configCalls).toHaveLength(0);
+  });
+});
+
+// ─── readSubagentMetadata: parse rehydration metadata from JSONL ─────
+// Streams a JSONL file and returns the LAST subagent:config entry's details.
+// Old files without the entry yield undefined. Real temp files (not mocks)
+// because the reader uses node:fs/createReadStream under the hood.
+describe("readSubagentMetadata", () => {
+  let tmp: string;
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), "pi-subagent-meta-"));
+  });
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("returns the details of the subagent:config entry", async () => {
+    const file = join(tmp, "s.jsonl");
+    writeFileSync(file, [
+      JSON.stringify({ type: "session", version: 3, id: "abc", timestamp: "2026-01-01T00:00:00Z", cwd: "/p" }),
+      JSON.stringify({
+        type: "custom_message", customType: "subagent:config", content: "", display: false,
+        details: { type: "Explore", originalPrompt: "find it", configSnapshot: { resolvedModelKey: "anthropic/x" } },
+        id: "e1", parentId: null, timestamp: "2026-01-01T00:00:01Z",
+      }),
+    ].join("\n") + "\n");
+
+    const { readSubagentMetadata } = await import("../src/agent-runner.js");
+    const meta = await readSubagentMetadata(file);
+
+    expect(meta).toEqual({
+      type: "Explore",
+      originalPrompt: "find it",
+      configSnapshot: { resolvedModelKey: "anthropic/x" },
+    });
+  });
+
+  it("returns undefined for a file with no subagent:config entry (backward compatible)", async () => {
+    const file = join(tmp, "s.jsonl");
+    writeFileSync(file, [
+      JSON.stringify({ type: "session", version: 3, id: "abc", timestamp: "2026-01-01T00:00:00Z", cwd: "/p" }),
+      JSON.stringify({ type: "message", id: "m1", parentId: null, timestamp: "2026-01-01T00:00:01Z", message: { role: "user", content: "hi" } }),
+    ].join("\n") + "\n");
+
+    const { readSubagentMetadata } = await import("../src/agent-runner.js");
+    const meta = await readSubagentMetadata(file);
+
+    expect(meta).toBeUndefined();
+  });
+
+  it("returns the LATEST entry when multiple are present (rehydrate re-writes)", async () => {
+    const file = join(tmp, "s.jsonl");
+    writeFileSync(file, [
+      JSON.stringify({ type: "session", version: 3, id: "abc", timestamp: "2026-01-01T00:00:00Z", cwd: "/p" }),
+      JSON.stringify({
+        type: "custom_message", customType: "subagent:config", content: "", display: false,
+        details: { type: "Explore", originalPrompt: "old", configSnapshot: {} }, id: "e1", parentId: null, timestamp: "2026-01-01T00:00:01Z",
+      }),
+      JSON.stringify({
+        type: "custom_message", customType: "subagent:config", content: "", display: false,
+        details: { type: "Plan", originalPrompt: "new", configSnapshot: {} }, id: "e2", parentId: "e1", timestamp: "2026-01-01T00:00:02Z",
+      }),
+    ].join("\n") + "\n");
+
+    const { readSubagentMetadata } = await import("../src/agent-runner.js");
+    const meta = await readSubagentMetadata(file);
+
+    expect(meta?.type).toBe("Plan");
+    expect(meta?.originalPrompt).toBe("new");
+  });
+
+  it("ignores entries with other customType and malformed lines", async () => {
+    const file = join(tmp, "s.jsonl");
+    writeFileSync(file, [
+      "this is not json at all",
+      JSON.stringify({
+        type: "custom_message", customType: "subagent:task-instruction", content: "some task", display: false, id: "t1", parentId: null, timestamp: "2026-01-01T00:00:01Z",
+      }),
+      JSON.stringify({
+        type: "custom_message", customType: "subagent:config", content: "", display: false,
+        details: { type: "Explore", originalPrompt: "ok", configSnapshot: {} }, id: "e1", parentId: null, timestamp: "2026-01-01T00:00:02Z",
+      }),
+    ].join("\n") + "\n");
+
+    const { readSubagentMetadata } = await import("../src/agent-runner.js");
+    const meta = await readSubagentMetadata(file);
+
+    expect(meta?.originalPrompt).toBe("ok");
+  });
+
+  it("ignores entries whose details are missing", async () => {
+    const file = join(tmp, "s.jsonl");
+    writeFileSync(file, [
+      JSON.stringify({
+        type: "custom_message", customType: "subagent:config", content: "", display: false,
+        details: undefined, id: "e1", parentId: null, timestamp: "2026-01-01T00:00:01Z",
+      }),
+    ].join("\n") + "\n");
+
+    const { readSubagentMetadata } = await import("../src/agent-runner.js");
+    expect(await readSubagentMetadata(file)).toBeUndefined();
+  });
+});
+
+// ─── discoverSubagentSessions: scan a sessions dir for resumable subagents ──
+describe("discoverSubagentSessions", () => {
+  let tmp: string;
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), "pi-subagent-disc-"));
+  });
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  function writeConfig(parentSessionId: string, file: string, details: any) {
+    const dir = join(tmp, "subagents", parentSessionId);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, file), [
+      JSON.stringify({ type: "session", version: 3, id: parentSessionId, timestamp: "2026-01-01T00:00:00Z", cwd: "/p" }),
+      JSON.stringify({
+        type: "custom_message", customType: "subagent:config", content: "", display: false,
+        details, id: "e1", parentId: null, timestamp: "2026-01-01T00:00:01Z",
+      }),
+    ].join("\n") + "\n");
+  }
+
+  it("returns metadata for every JSONL carrying subagent:config", async () => {
+    writeConfig("sess-a", "2026-01-01T00-00-00-000Z_a.jsonl", {
+      type: "Explore", originalPrompt: "a", configSnapshot: {},
+    });
+    writeConfig("sess-b", "2026-01-01T00-00-00-000Z_b.jsonl", {
+      type: "Plan", originalPrompt: "b", configSnapshot: {},
+    });
+
+    const { discoverSubagentSessions } = await import("../src/agent-runner.js");
+    const found = await discoverSubagentSessions(tmp);
+
+    expect(found).toHaveLength(2);
+    const byPrompt = new Map(found.map((f) => [f.metadata.originalPrompt, f]));
+    expect(byPrompt.get("a")?.metadata.type).toBe("Explore");
+    expect(byPrompt.get("b")?.metadata.type).toBe("Plan");
+  });
+
+  it("skips JSONLs without subagent:config (e.g. legacy audit-log files)", async () => {
+    const dir = join(tmp, "subagents", "sess-a");
+    mkdirSync(dir, { recursive: true });
+    // Legacy isSidechain audit-log format — no subagent:config entry
+    writeFileSync(join(dir, "agent-1.jsonl"),
+      JSON.stringify({ isSidechain: true, agentId: "agent-1", type: "user", message: { role: "user", content: "hi" } }) + "\n");
+
+    const { discoverSubagentSessions } = await import("../src/agent-runner.js");
+    expect(await discoverSubagentSessions(tmp)).toEqual([]);
+  });
+
+  it("returns [] when the subagents/ directory does not exist", async () => {
+    const { discoverSubagentSessions } = await import("../src/agent-runner.js");
+    expect(await discoverSubagentSessions(tmp)).toEqual([]);
+  });
+});
+
+
 // The slow path for manager.resume() when the live session is gone. Opens
 // the JSONL via SessionManager.open and reconstructs the full session
 // config from the agent type — same construction path as runAgent, just

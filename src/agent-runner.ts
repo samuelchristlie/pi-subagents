@@ -2,8 +2,10 @@
  * agent-runner.ts — Core execution engine: creates sessions, runs agents, collects results.
  */
 
+import { createReadStream, existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { createInterface } from "node:readline";
 import type { Model } from "@earendil-works/pi-ai";
 import type { LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
 import {
@@ -24,7 +26,7 @@ import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
-import type { SubagentType, ThinkingLevel } from "./types.js";
+import type { SubagentSessionConfig, SubagentType, ThinkingLevel } from "./types.js";
 
 /**
  * Tool names registered by THIS extension. Single source of truth so the
@@ -217,6 +219,14 @@ export interface SessionBuildOptions {
   configCwd?: string;
   /** Called with setup-time warnings (unknown tools, missing extensions). */
   onToolActivity?: (activity: ToolActivity) => void;
+  /**
+   * If set, persist this rehydration metadata into the session JSONL as a
+   * `subagent:config` custom_message entry right after `bindExtensions()`.
+   * Lets a later `resumeFromDisk()` rebuild the agent purely from the JSONL
+   * after the in-memory `AgentRecord` is gone. Only meaningful for persisted
+   * sessions (in-memory sessions have no JSONL to read back).
+   */
+  persistConfig?: SubagentSessionConfig;
 }
 
 export interface RunOptions extends SessionBuildOptions {
@@ -327,7 +337,30 @@ export async function runAgent(
     ? SessionManager.create(effectiveCwd, options.sessionDir)
     : SessionManager.inMemory(effectiveCwd);
 
-  const { session } = await buildSessionDeps(ctx, type, options, sessionManager);
+  // Build the rehydration config to embed in the JSONL. Only meaningful for
+  // persisted sessions — in-memory sessions have no file to read back from.
+  // The snapshot mirrors exactly what the manager captures on the
+  // AgentRecord.configSnapshot (same field-by-field resolution), so a
+  // record rehydrated from disk matches one rehydrated from the in-memory map.
+  const persistConfig: SubagentSessionConfig | undefined = options.sessionDir
+    ? {
+        type,
+        originalPrompt: prompt,
+        configSnapshot: {
+          resolvedModelKey: options.model
+            ? `${options.model.provider}/${options.model.id}`
+            : undefined,
+          thinkingLevel: options.thinkingLevel,
+          isolated: options.isolated,
+          cwd: options.cwd,
+          configCwd: options.configCwd,
+        },
+      }
+    : undefined;
+
+  const { session } = await buildSessionDeps(
+    ctx, type, { ...options, persistConfig }, sessionManager,
+  );
 
   options.onSessionCreated?.(session);
 
@@ -347,6 +380,12 @@ export async function runAgent(
  * same as a fresh spawn. If the agent definition changed between spawn and
  * resume, the rehydrated session picks up the new definition — that's the
  * least-surprising behavior (matching how pi itself reloads sessions).
+ *
+ * If `options.persistConfig` is set, the `subagent:config` metadata is
+ * re-written after `bindExtensions()` so it stays current on disk (e.g. when
+ * a caller updates `originalPrompt` for a resumed task). The previous entry
+ * remains in the JSONL history; readers always take the latest (see
+ * `readSubagentMetadata`).
  */
 export async function rehydrateAgent(
   ctx: ExtensionContext,
@@ -672,6 +711,24 @@ async function buildSessionDeps(
     },
   });
 
+  // Persist rehydration metadata into the JSONL itself. This is what makes a
+  // subagent session resumable from disk after the in-memory AgentRecord is
+  // cleaned up — `readSubagentMetadata()` reads it back to rebuild type /
+  // originalPrompt / configSnapshot. Mirrors pi-main's pattern of embedding
+  // all session metadata in the JSONL (no sidecar map file).
+  //
+  // `display: false` keeps it out of the TUI; the LLM still sees the entry in
+  // context, but its content is empty ("" — the payload is in `details`).
+  // Re-written on rehydrate so resume keeps the metadata current.
+  if (options.persistConfig) {
+    session.sessionManager.appendCustomMessageEntry(
+      SUBAGENT_CONFIG_CUSTOM_TYPE,
+      "",
+      false, // display — invisible in TUI
+      options.persistConfig,
+    );
+  }
+
   return { session, systemPrompt, allowedTools };
 }
 
@@ -847,6 +904,15 @@ export async function steerAgent(
 const TASK_INSTRUCTION_CUSTOM_TYPE = "subagent:task-instruction";
 
 /**
+ * Custom-message type for the rehydration config entry embedded in the JSONL.
+ *
+ * A `custom_message` entry with this type carries a `SubagentSessionConfig` in
+ * its `details` field (content is empty, display is false). `readSubagentMetadata`
+ * scans the JSONL for it; `resumeFromDisk` uses the result to rebuild the agent.
+ */
+const SUBAGENT_CONFIG_CUSTOM_TYPE = "subagent:config";
+
+/**
  * Inject the original task instruction as a custom_message entry after compaction.
  *
  * After a successful compaction the original first user message (the task
@@ -868,6 +934,97 @@ function injectTaskInstruction(
     false,    // display — invisible to the user (no custom UI rendering)
     undefined, // details
   );
+}
+
+/**
+ * Read the `subagent:config` rehydration metadata from a session JSONL.
+ *
+ * Streams the file line-by-line (no full load) and returns the `details` of
+ * the LAST `subagent:config` `custom_message` entry — rehydrate re-writes the
+ * entry on each resume, so "latest wins" matches the on-disk current state.
+ * Returns `undefined` when the file has no such entry (old JSONLs predating
+ * this feature, non-subagent files, malformed lines). Analogous to pi-main's
+ * `buildSessionInfo()` reconstructing metadata from JSONL content.
+ *
+ * Lines that fail to parse are skipped (the underlying SessionManager parser
+ * behaves the same way), so a partially-corrupt file still yields whatever
+ * config it can find.
+ */
+export async function readSubagentMetadata(
+  sessionFilePath: string,
+): Promise<SubagentSessionConfig | undefined> {
+  let latest: SubagentSessionConfig | undefined;
+  const rl = createInterface({
+    input: createReadStream(sessionFilePath, { encoding: "utf8" }),
+    crlfDelay: Infinity,
+  });
+  for await (const line of rl) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let entry: any;
+    try {
+      entry = JSON.parse(trimmed);
+    } catch {
+      continue; // skip malformed lines
+    }
+    if (
+      entry &&
+      entry.type === "custom_message" &&
+      entry.customType === SUBAGENT_CONFIG_CUSTOM_TYPE &&
+      entry.details
+    ) {
+      latest = entry.details as SubagentSessionConfig;
+    }
+  }
+  return latest;
+}
+
+/**
+ * Scan a parent session directory's `subagents/` subtree for resumable
+ * subagent sessions. Returns one entry per JSONL that carries a
+ * `subagent:config` block, in arbitrary (filesystem) order.
+ *
+ * Layout: `<sessionsDir>/subagents/<parent-session-id>/<file>.jsonl`.
+ * Both the pi-format session files (`<timestamp>_<id>.jsonl`) and the legacy
+ * audit-log files (`<agentId>.jsonl`, `isSidechain:true`) live here; only the
+ * former carry `subagent:config`, so the audit logs are naturally skipped.
+ * Non-existent `subagents/` returns `[]`.
+ */
+export async function discoverSubagentSessions(
+  sessionsDir: string,
+): Promise<Array<{ sessionFilePath: string; metadata: SubagentSessionConfig }>> {
+  const subagentsDir = join(sessionsDir, "subagents");
+  if (!existsSync(subagentsDir)) return [];
+
+  const results: Array<{ sessionFilePath: string; metadata: SubagentSessionConfig }> = [];
+  let parentDirs: string[];
+  try {
+    parentDirs = readdirSync(subagentsDir).map((name) => join(subagentsDir, name));
+  } catch {
+    return [];
+  }
+  for (const parentPath of parentDirs) {
+    let isDir = false;
+    try {
+      isDir = statSync(parentPath).isDirectory();
+    } catch {
+      continue;
+    }
+    if (!isDir) continue;
+    let files: string[];
+    try {
+      files = readdirSync(parentPath);
+    } catch {
+      continue;
+    }
+    for (const file of files) {
+      if (!file.endsWith(".jsonl")) continue;
+      const filePath = join(parentPath, file);
+      const meta = await readSubagentMetadata(filePath);
+      if (meta) results.push({ sessionFilePath: filePath, metadata: meta });
+    }
+  }
+  return results;
 }
 
 export function getAgentConversation(session: AgentSession): string {
