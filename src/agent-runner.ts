@@ -355,6 +355,11 @@ export async function runAgent(
           cwd: options.cwd,
           configCwd: options.configCwd,
         },
+        // Persist the manager-assigned id so a later resumeFromDisk() reuses
+        // the same record instead of minting a parallel one. Omitted
+        // (undefined) when the caller didn't pass agentId — JSON.stringify
+        // drops it, preserving the pre-id-persistence on-disk shape.
+        id: options.agentId,
       }
     : undefined;
 

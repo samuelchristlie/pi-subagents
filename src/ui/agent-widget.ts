@@ -265,11 +265,13 @@ export class AgentWidget {
     return age < maxAge;
   }
 
-  /** Record an agent as finished (call when agent completes). */
+  /** Record an agent as finished (call when agent completes).
+   *  Always resets the age to 0 — a resumed agent that completes again must
+   *  show a fresh finished line, not inherit a stale age from its prior run
+   *  (which previously happened because of the `has()` guard short-circuited
+   *  the second completion). */
   markFinished(agentId: string) {
-    if (!this.finishedTurnAge.has(agentId)) {
-      this.finishedTurnAge.set(agentId, 0);
-    }
+    this.finishedTurnAge.set(agentId, 0);
   }
 
   /** Render a finished agent line. */
@@ -322,11 +324,15 @@ export class AgentWidget {
       && this.shouldShowFinished(a.id, a.status),
     );
 
+    const resumable = this.manager.listResumable();
+
     const hasActive = running.length > 0 || queued.length > 0;
     const hasFinished = finished.length > 0;
 
-    // Nothing to show — return empty (widget will be unregistered by update())
-    if (!hasActive && !hasFinished) return [];
+    // Nothing to show — return empty (widget will be unregistered by update()).
+    // Resumable (disk-persisted, not live) sessions count as "something to
+    // show" so the widget stays up as a pointer to /agents.
+    if (!hasActive && !hasFinished && resumable.length === 0) return [];
 
     const w = tui.terminal.columns;
     const truncate = (line: string) => truncateToWidth(line, w);
@@ -385,6 +391,18 @@ export class AgentWidget {
       lines.push(...finishedLines);
       for (const pair of runningLines) lines.push(...pair);
       if (queuedLine) lines.push(queuedLine);
+
+      // Stopped/resumable sessions (disk-persisted, not live). Summary only —
+      // the /agents menu has the per-session list + resume action. Appended
+      // last so the connector fix-up below terminates the tree here; sourced
+      // from listResumable() (JSONL paths), never the live `agents` map, so it
+      // can't double-count with a running/finished record.
+      if (resumable.length > 0) {
+        const n = resumable.length;
+        lines.push(truncate(
+          theme.fg("dim", "├─ ") + theme.fg("dim", `■ ${n} resumable session${n === 1 ? "" : "s"} · /agents to resume`),
+        ));
+      }
 
       // Fix last connector: swap ├─ → └─ and │ → space for activity lines.
       if (lines.length > 1) {
@@ -455,14 +473,23 @@ export class AgentWidget {
     let queuedCount = 0;
     let hasFinished = false;
     for (const a of allAgents) {
-      if (a.status === "running") { runningCount++; }
-      else if (a.status === "queued") { queuedCount++; }
-      else if (a.completedAt && this.shouldShowFinished(a.id, a.status)) { hasFinished = true; }
+      if (a.status === "running" || a.status === "queued") {
+        // Active again (resume, resumeFromDisk, or a re-spawn under the same
+        // id) — drop any stale finished-linger state so the next completion
+        // renders a fresh finished line instead of mis-aging the old one.
+        this.finishedTurnAge.delete(a.id);
+        if (a.status === "running") runningCount++;
+        else queuedCount++;
+      } else if (a.completedAt && this.shouldShowFinished(a.id, a.status)) {
+        hasFinished = true;
+      }
     }
     const hasActive = runningCount > 0 || queuedCount > 0;
+    const hasResumable = this.manager.listResumable().length > 0;
 
-    // Nothing to show — clear widget
-    if (!hasActive && !hasFinished) {
+    // Nothing to show — clear widget. (Resumable sessions keep it up as a
+    // pointer to /agents even when no agent is currently active.)
+    if (!hasActive && !hasFinished && !hasResumable) {
       if (this.widgetRegistered) {
         this.uiCtx.setWidget("agents", undefined);
         this.widgetRegistered = false;

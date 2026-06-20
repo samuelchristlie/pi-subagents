@@ -12,7 +12,7 @@ import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { readSubagentMetadata, rehydrateAgent, resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
-import type { AgentInvocation, AgentRecord, IsolationMode, SubagentType, ThinkingLevel } from "./types.js";
+import type { AgentInvocation, AgentRecord, IsolationMode, SubagentSessionConfig, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage } from "./usage.js";
 import { cleanupWorktree, createWorktree, pruneWorktrees, } from "./worktree.js";
 
@@ -124,8 +124,33 @@ interface SpawnOptions {
   onCompaction?: (info: CompactionInfo) => void;
 }
 
+/**
+ * A disk-persisted subagent session available for resume without a live
+ * `AgentRecord`. Populated by `loadResumable` from a `discoverSubagentSessions`
+ * scan on session_start, surfaced in the `/agents` menu and the widget's
+ * "stopped" section, and promoted to a live record (then removed from the
+ * registry) by `resumeFromDisk`.
+ */
+export interface ResumableEntry {
+  /** Filesystem path of the JSONL — unique registry key (can't collide with
+   *  in-memory agent ids, which are UUID prefixes). */
+  sessionFilePath: string;
+  /** Persisted agent id if the JSONL carried one (new files); undefined for
+   *  JSONLs predating id persistence. */
+  id?: string;
+  metadata: SubagentSessionConfig;
+  /** Truncated original prompt, same shape as `AgentRecord.description`. */
+  description: string;
+}
+
 export class AgentManager {
   private agents = new Map<string, AgentRecord>();
+  /** Disk-persisted sessions available for resume, keyed by JSONL path.
+   *  Populated by `loadResumable` on session_start; drained by `resumeFromDisk`. */
+  private resumable = new Map<string, ResumableEntry>();
+  /** JSONL paths with an in-flight `resumeFromDisk` — guards against concurrent
+   *  resumes of the same file racing past the `agents.has()` check. */
+  private resumingFiles = new Set<string>();
   private cleanupInterval: ReturnType<typeof setInterval>;
   private onComplete?: OnAgentComplete;
   private onStart?: OnAgentStart;
@@ -531,14 +556,50 @@ export class AgentManager {
    * usable after the in-memory map was cleared (cleanup timer, `clearCompleted()`,
    * or a fresh process) as long as the session file is still on disk.
    *
-   * Rehydration metadata (`type`, `originalPrompt`, `configSnapshot`) is read
-   * from the `subagent:config` entry embedded in the JSONL, so no sidecar map
-   * file is needed. Returns `undefined` when the file has no such entry (old
-   * JSONL or non-subagent file) or when `ctx`/`pi` are missing. On success the
-   * rebuilt record is registered in the map (so subsequent `resume(id, ...)`
-   * calls take the fast path) and the prompt is driven to completion.
+   * Rehydration metadata (`type`, `originalPrompt`, `configSnapshot`, and —
+   * since id persistence — `id`) is read from the `subagent:config` entry
+   * embedded in the JSONL, so no sidecar map file is needed. Returns
+   * `undefined` when the file has no such entry (old JSONL or non-subagent
+   * file) or when `ctx`/`pi` are missing.
+   *
+   * Id continuity keeps a disk-resumed agent "one and the same" as the
+   * original rather than a parallel row:
+   *   - If `meta.id` matches a record still live in the map (cleanup hasn't
+   *     evicted it yet), delegate to `resume()` — that mutates the existing
+   *     record in place and preserves its accumulated history (toolUses,
+   *     lifetimeUsage, compactionCount, prior result).
+   *   - Otherwise rebuild a fresh record, but registered under `meta.id`
+   *     (falling back to a minted id only for JSONLs predating id
+   *     persistence). The id is re-written to disk via `persistConfig`, so
+   *     subsequent cold resumes land on this same record.
    */
   async resumeFromDisk(
+    sessionFilePath: string,
+    prompt: string,
+    options: { ctx: ExtensionContext; pi: ExtensionAPI; signal?: AbortSignal },
+  ): Promise<AgentRecord | undefined> {
+    // Concurrent resumes of the same file would race past the agents.has()
+    // check in the inner method and mint two records. Reject the second
+    // caller outright (design choice: reject beats queue for a user-driven
+    // resume action).
+    if (this.resumingFiles.has(sessionFilePath)) {
+      throw new Error("Already resuming this session; wait for the in-flight resume to finish.");
+    }
+    this.resumingFiles.add(sessionFilePath);
+    // Promote out of the resumable registry now — the file is being adopted
+    // into a live record (or delegated to an existing one), so it must not
+    // also show up as "stopped/resumable" in the widget or /agents menu.
+    this.resumable.delete(sessionFilePath);
+    try {
+      return await this.resumeFromDiskInner(sessionFilePath, prompt, options);
+    } finally {
+      this.resumingFiles.delete(sessionFilePath);
+    }
+  }
+
+  /** Disk-resume implementation. Guarded by the public `resumeFromDisk`
+   *  wrapper above (in-flight dedup + registry eviction). */
+  private async resumeFromDiskInner(
     sessionFilePath: string,
     prompt: string,
     options: { ctx: ExtensionContext; pi: ExtensionAPI; signal?: AbortSignal },
@@ -548,7 +609,18 @@ export class AgentManager {
     const meta = await readSubagentMetadata(sessionFilePath);
     if (!meta) return undefined;
 
-    const id = randomUUID().slice(0, 17);
+    // Fast path: the persisted id matches a record still in the map (cleanup
+    // hasn't evicted it). Delegate to resume() so the existing record is
+    // mutated in place and its history is preserved — no parallel row.
+    // `resume()` handles both the live-session and rehydrate-from-disk cases.
+    if (meta.id && this.agents.has(meta.id)) {
+      return this.resume(meta.id, prompt, options);
+    }
+
+    // Reuse the persisted id when present so future resume(id) /
+    // resumeFromDisk() calls target this same record. Only mint a fresh id
+    // for JSONLs predating id persistence (old files have no `id` field).
+    const id = meta.id ?? randomUUID().slice(0, 17);
     const abortController = new AbortController();
     const record: AgentRecord = {
       id,
@@ -569,8 +641,10 @@ export class AgentManager {
     let session: AgentSession;
     try {
       const model = resolveModelFromSnapshot(ctx, meta.configSnapshot);
-      // `persistConfig` re-writes the `subagent:config` entry so the metadata
-      // stays current on disk across resumes (latest-wins on read).
+      // Re-write the `subagent:config` entry so metadata stays current on
+      // disk (latest-wins on read). Carries `id` forward — and for the
+      // fallback-minted case, persists it so the next cold resume reuses it.
+      const persistConfig = { ...meta, id };
       session = await rehydrateAgent(ctx, meta.type, sessionFilePath, {
         pi,
         agentId: id,
@@ -579,7 +653,7 @@ export class AgentManager {
         isolated: meta.configSnapshot?.isolated,
         cwd: meta.configSnapshot?.cwd,
         configCwd: meta.configSnapshot?.configCwd,
-        persistConfig: meta,
+        persistConfig,
       });
       record.session = session;
     } catch (err) {
@@ -624,6 +698,36 @@ export class AgentManager {
     return [...this.agents.values()].sort(
       (a, b) => b.startedAt - a.startedAt,
     );
+  }
+
+  /**
+   * Rebuild the resumable-session registry from a disk scan (typically
+   * `discoverSubagentSessions` on session_start). Replaces the registry
+   * wholesale. Entries whose `metadata.id` is already live in memory are
+   * skipped — they surface via `listAgents()`, not here, so a running agent
+   * can't also appear as "stopped/resumable".
+   */
+  loadResumable(entries: Array<{ sessionFilePath: string; metadata: SubagentSessionConfig }>): void {
+    this.resumable.clear();
+    for (const { sessionFilePath, metadata } of entries) {
+      if (metadata.id && this.agents.has(metadata.id)) continue;
+      this.resumable.set(sessionFilePath, {
+        sessionFilePath,
+        id: metadata.id,
+        metadata,
+        description: metadata.originalPrompt.slice(0, 80),
+      });
+    }
+  }
+
+  /** Empty the resumable registry (e.g. on session teardown). */
+  clearResumable(): void {
+    this.resumable.clear();
+  }
+
+  /** All disk-persisted sessions currently available for resume. */
+  listResumable(): ResumableEntry[] {
+    return [...this.resumable.values()];
   }
 
   abort(id: string): boolean {

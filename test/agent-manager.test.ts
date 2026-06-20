@@ -1177,4 +1177,201 @@ describe("AgentManager — resumeFromDisk", () => {
     // originalPrompt is preserved untruncated.
     expect(result!.originalPrompt).toBe(longPrompt);
   });
+
+  it("delegates to resume() when meta.id matches a live record (preserves history)", async () => {
+    // Spawn a real agent so there's a live record with an id + a live session.
+    const sess = { ...mockSession() };
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "first", session: sess as any, aborted: false, steered: false,
+    });
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "p", {
+      description: "x", isBackground: true,
+    });
+    await manager.getRecord(id)!.promise;
+
+    // Simulate accumulated history from prior turns.
+    const rec = manager.getRecord(id)!;
+    rec.toolUses = 7;
+    rec.lifetimeUsage = { input: 100, output: 50, cacheWrite: 200 };
+
+    const { readSubagentMetadata, rehydrateAgent, resumeAgent } = await importMocks();
+    readSubagentMetadata.mockResolvedValue({
+      id, type: "general-purpose", originalPrompt: "p", configSnapshot: {},
+    });
+    resumeAgent.mockResolvedValue("continued");
+
+    const result = await manager.resumeFromDisk("/persisted/session.jsonl", "more", {
+      ctx: mockCtx, pi: mockPi,
+    });
+
+    // Same record — not a parallel row.
+    expect(result).toBe(rec);
+    expect(result!.id).toBe(id);
+    // Delegated to the fast-path resume(): no rehydration rebuild happened.
+    expect(rehydrateAgent).not.toHaveBeenCalled();
+    // The live session was driven.
+    expect(resumeAgent).toHaveBeenCalledWith(sess, "more", expect.anything());
+    // History preserved (resume() mutates in place — does not reset these).
+    expect(result!.toolUses).toBe(7);
+    expect(result!.lifetimeUsage).toEqual({ input: 100, output: 50, cacheWrite: 200 });
+    expect(result!.status).toBe("completed");
+    expect(result!.result).toBe("continued");
+  });
+
+  it("reuses the persisted id instead of minting when no live record exists", async () => {
+    const { readSubagentMetadata, rehydrateAgent, resumeAgent } = await importMocks();
+    readSubagentMetadata.mockResolvedValue({
+      id: "persisted-id-123",
+      type: "Explore",
+      originalPrompt: "the original task",
+      configSnapshot: { thinkingLevel: "high" },
+    });
+    rehydrateAgent.mockResolvedValue({ ...mockSession() } as any);
+    resumeAgent.mockResolvedValue("ok");
+
+    manager = new AgentManager();
+    const result = await manager.resumeFromDisk("/persisted/session.jsonl", "go", {
+      ctx: mockCtx, pi: mockPi,
+    });
+
+    // The persisted id is reused — not a fresh randomUUID.
+    expect(result!.id).toBe("persisted-id-123");
+    // Registered under that id, so a later resume(id) hits the fast path.
+    expect(manager.getRecord("persisted-id-123")).toBe(result);
+    // rehydrateAgent received the same id, and persistConfig carries it forward.
+    const [, , , opts] = rehydrateAgent.mock.lastCall! as any[];
+    expect(opts).toMatchObject({
+      agentId: "persisted-id-123",
+      persistConfig: { id: "persisted-id-123", type: "Explore", originalPrompt: "the original task" },
+    });
+    expect(result!.status).toBe("completed");
+  });
+});
+
+// ─── resumable registry: disk-persisted sessions available for resume ───
+// Populated by loadResumable() from a discoverSubagentSessions() scan on
+// session_start, surfaced in /agents + the widget, and drained by
+// resumeFromDisk() as each entry is promoted to a live record.
+describe("AgentManager — resumable registry", () => {
+  let manager: AgentManager;
+  afterEach(() => manager?.dispose());
+
+  async function importMocks() {
+    const mod = await import("../src/agent-runner.js");
+    return {
+      readSubagentMetadata: vi.mocked(mod.readSubagentMetadata),
+      rehydrateAgent: vi.mocked(mod.rehydrateAgent),
+      resumeAgent: vi.mocked(mod.resumeAgent),
+    };
+  }
+
+  beforeEach(async () => {
+    const m = await importMocks();
+    m.readSubagentMetadata.mockClear();
+    m.readSubagentMetadata.mockReset();
+    m.rehydrateAgent.mockClear();
+    m.rehydrateAgent.mockReset();
+    m.resumeAgent.mockClear();
+    m.resumeAgent.mockReset();
+  });
+
+  it("loadResumable/listResumable round-trip entries from a disk scan", () => {
+    manager = new AgentManager();
+    manager.loadResumable([
+      { sessionFilePath: "/s/a.jsonl", metadata: { type: "Explore", originalPrompt: "find x", configSnapshot: {} } },
+      { sessionFilePath: "/s/b.jsonl", metadata: { type: "general-purpose", originalPrompt: "y".repeat(200), configSnapshot: {} } },
+    ]);
+    const entries = manager.listResumable();
+    expect(entries).toHaveLength(2);
+    expect(entries.map((e) => e.sessionFilePath).sort()).toEqual(["/s/a.jsonl", "/s/b.jsonl"]);
+    // description truncated the same way as AgentRecord.description.
+    const b = entries.find((e) => e.sessionFilePath === "/s/b.jsonl")!;
+    expect(b.description).toHaveLength(80);
+  });
+
+  it("loadResumable skips entries whose id is already a live agent", async () => {
+    const sess = { ...mockSession() };
+    vi.mocked(runAgent).mockResolvedValue({ responseText: "ok", session: sess as any, aborted: false, steered: false });
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "p", { description: "x", isBackground: true });
+    await manager.getRecord(id)!.promise;
+
+    manager.loadResumable([
+      { sessionFilePath: "/s/live.jsonl", metadata: { id, type: "general-purpose", originalPrompt: "p", configSnapshot: {} } },
+      { sessionFilePath: "/s/other.jsonl", metadata: { type: "Explore", originalPrompt: "q", configSnapshot: {} } },
+    ]);
+    expect(manager.listResumable().map((e) => e.sessionFilePath)).toEqual(["/s/other.jsonl"]);
+  });
+
+  it("loadResumable replaces the registry wholesale on each call", () => {
+    manager = new AgentManager();
+    manager.loadResumable([{ sessionFilePath: "/old.jsonl", metadata: { type: "Explore", originalPrompt: "old", configSnapshot: {} } }]);
+    manager.loadResumable([{ sessionFilePath: "/new.jsonl", metadata: { type: "Explore", originalPrompt: "new", configSnapshot: {} } }]);
+    expect(manager.listResumable().map((e) => e.sessionFilePath)).toEqual(["/new.jsonl"]);
+  });
+
+  it("resumeFromDisk evicts the entry from the registry (fresh-record path)", async () => {
+    const { readSubagentMetadata, rehydrateAgent, resumeAgent } = await importMocks();
+    readSubagentMetadata.mockResolvedValue({ type: "Explore", originalPrompt: "task", configSnapshot: {} });
+    rehydrateAgent.mockResolvedValue({ ...mockSession() } as any);
+    resumeAgent.mockResolvedValue("ok");
+
+    manager = new AgentManager();
+    manager.loadResumable([{ sessionFilePath: "/p.jsonl", metadata: { type: "Explore", originalPrompt: "task", configSnapshot: {} } }]);
+    expect(manager.listResumable()).toHaveLength(1);
+
+    await manager.resumeFromDisk("/p.jsonl", "go", { ctx: mockCtx, pi: mockPi });
+
+    // Promoted to a live record — no longer listed as resumable.
+    expect(manager.listResumable()).toEqual([]);
+    expect(manager.listAgents()).toHaveLength(1);
+  });
+
+  it("resumeFromDisk evicts the entry even on the delegation path", async () => {
+    const sess = { ...mockSession() };
+    vi.mocked(runAgent).mockResolvedValue({ responseText: "first", session: sess as any, aborted: false, steered: false });
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "p", { description: "x", isBackground: true });
+    await manager.getRecord(id)!.promise;
+
+    const { readSubagentMetadata, resumeAgent } = await importMocks();
+    readSubagentMetadata.mockResolvedValue({ id, type: "general-purpose", originalPrompt: "p", configSnapshot: {} });
+    resumeAgent.mockResolvedValue("continued");
+
+    manager.loadResumable([{ sessionFilePath: "/p.jsonl", metadata: { id, type: "general-purpose", originalPrompt: "p", configSnapshot: {} } }]);
+    await manager.resumeFromDisk("/p.jsonl", "more", { ctx: mockCtx, pi: mockPi });
+
+    expect(manager.listResumable()).toEqual([]);
+  });
+
+  it("rejects a concurrent resume of the same file while one is in-flight", async () => {
+    const { readSubagentMetadata, rehydrateAgent, resumeAgent } = await importMocks();
+    // Stall the first resume so the second call lands while it's in-flight.
+    let resolveRead: (v: unknown) => void = () => {};
+    readSubagentMetadata.mockReturnValue(new Promise((r) => { resolveRead = r; }));
+    rehydrateAgent.mockResolvedValue({ ...mockSession() } as any);
+    resumeAgent.mockResolvedValue("ok");
+
+    manager = new AgentManager();
+    manager.loadResumable([{ sessionFilePath: "/p.jsonl", metadata: { type: "Explore", originalPrompt: "task", configSnapshot: {} } }]);
+
+    const first = manager.resumeFromDisk("/p.jsonl", "go", { ctx: mockCtx, pi: mockPi });
+    // Second concurrent attempt must reject, not race past the guard.
+    await expect(manager.resumeFromDisk("/p.jsonl", "go", { ctx: mockCtx, pi: mockPi }))
+      .rejects.toThrow(/Already resuming/);
+
+    // Let the first finish; it still succeeds and evicts the entry.
+    resolveRead({ type: "Explore", originalPrompt: "task", configSnapshot: {} });
+    const result = await first;
+    expect(result?.status).toBe("completed");
+    expect(manager.listResumable()).toEqual([]);
+  });
+
+  it("clearResumable empties the registry", () => {
+    manager = new AgentManager();
+    manager.loadResumable([{ sessionFilePath: "/p.jsonl", metadata: { type: "Explore", originalPrompt: "t", configSnapshot: {} } }]);
+    manager.clearResumable();
+    expect(manager.listResumable()).toEqual([]);
+  });
 });

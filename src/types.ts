@@ -162,6 +162,15 @@ export interface SubagentSessionConfig {
   originalPrompt: string;
   /** Spawn-time config overrides (model, thinking, cwd, etc.). */
   configSnapshot: AgentConfigSnapshot;
+  /**
+   * Manager-assigned agent id (`AgentRecord.id`). Persisted so a later
+   * `resumeFromDisk()` can reuse the same record instead of minting a fresh
+   * one — keeps a disk-resumed agent "one and the same" as the original
+   * across cleanup. Optional only for JSONLs written before this field
+   * existed; when missing, `resumeFromDisk` falls back to a fresh id (the
+   * pre-existing behavior).
+   */
+  id?: string;
 }
 
 export interface AgentInvocation {

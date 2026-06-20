@@ -36,6 +36,18 @@ export function createOutputFilePath(cwd: string, agentId: string, sessionId: st
 }
 
 /**
+ * Project-scoped sessions directory: the parent of every
+ * `subagents/<parent-session-id>/` tree for this cwd. Pass this to
+ * `discoverSubagentSessions` to enumerate resumable subagent JSONLs across
+ * all parent sessions in the project (it recurses into `subagents/` itself).
+ */
+export function resolveProjectSessionsDir(cwd: string): string {
+  const encoded = encodeCwd(cwd);
+  const home = process.env.HOME || process.env.USERPROFILE || tmpdir();
+  return join(home, ".pi", "agent", "sessions", `--${encoded}--`);
+}
+
+/**
  * Directory holding a subagent's persisted pi-format session JSONL.
  *
  * Sibling to `createOutputFilePath`'s directory so the JSONL and the audit
@@ -45,9 +57,7 @@ export function createOutputFilePath(cwd: string, agentId: string, sessionId: st
  * never recurses into, so they don't clutter the main session list.
  */
 export function createSessionDir(cwd: string, sessionId: string): string {
-  const encoded = encodeCwd(cwd);
-  const home = process.env.HOME || process.env.USERPROFILE || tmpdir();
-  return join(home, ".pi", "agent", "sessions", `--${encoded}--`, "subagents", sessionId);
+  return join(resolveProjectSessionsDir(cwd), "subagents", sessionId);
 }
 
 /** Minimal tool definition shape for serialization. */

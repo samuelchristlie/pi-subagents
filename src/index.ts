@@ -10,13 +10,13 @@
  *   /agents                 — Interactive agent management menu
  */
 
-import { existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { AgentManager } from "./agent-manager.js";
-import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, normalizeMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, steerAgent } from "./agent-runner.js";
+import { discoverSubagentSessions, getAgentConversation, getDefaultMaxTurns, getGraceTurns, normalizeMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, isDefaultsDisabled, registerAgents, resolveType, setDefaultsDisabled } from "./agent-types.js";
 import { registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
@@ -24,7 +24,7 @@ import { isModelInScope, readEnabledModels, resolveEnabledModels } from "./enabl
 import { GroupJoinManager } from "./group-join.js";
 import { resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
-import { appendSystemSnapshot, createOutputFilePath, createSessionDir, streamToOutputFile, writeInitialEntry } from "./output-file.js";
+import { appendSystemSnapshot, createOutputFilePath, createSessionDir, resolveProjectSessionsDir, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
@@ -483,15 +483,41 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  /** Scan the project's persisted subagent sessions and rebuild the resumable
+   *  registry. Called from `session_start` after `clearCompleted()` wipes the
+   *  in-memory map, so disk-persisted agents surface in `/agents` and the
+   *  widget after a parent-session resume or restart. Fire-and-forget (caller
+   *  doesn't await) — the registry populates when the scan completes and the
+   *  widget picks it up on its next tick. */
+  async function loadResumableFromDisk(ctx: ExtensionContext) {
+    try {
+      const dir = resolveProjectSessionsDir(ctx.cwd);
+      const entries = await discoverSubagentSessions(dir);
+      manager.loadResumable(entries);
+    } catch (err) {
+      console.warn(
+        "[pi-subagents] Failed to scan persisted subagent sessions:",
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  }
+
   // Capture ctx from session_start for RPC spawn handler + start the scheduler.
   pi.on("session_start", async (_event, ctx) => {
     currentCtx = ctx;
     manager.clearCompleted();
+    // Rebuild the resumable registry from disk (non-blocking) so agents
+    // persisted under this project's sessions dir are reachable again after
+    // the in-memory map was just cleared.
+    void loadResumableFromDisk(ctx);
     if (isSchedulingEnabled() && !scheduler.isActive()) startScheduler(ctx);
   });
 
   pi.on("session_before_switch", () => {
     manager.clearCompleted();
+    // Drop the outgoing session's resumable entries; the incoming session's
+    // session_start handler repopulates from its own disk scan.
+    manager.clearResumable();
     scheduler.stop();
   });
 
@@ -1504,6 +1530,12 @@ Terse command-style prompts produce shallow, generic work.
       options.push(`Running agents (${agents.length}) — ${running} running, ${done} done`);
     }
 
+    // Resumable sessions (persisted on disk, not currently live in memory)
+    const resumableCount = manager.listResumable().length;
+    if (resumableCount > 0) {
+      options.push(`Resumable sessions (${resumableCount})`);
+    }
+
     // Agent types list
     if (allNames.length > 0) {
       options.push(`Agent types (${allNames.length})`);
@@ -1535,6 +1567,9 @@ Terse command-style prompts produce shallow, generic work.
     if (choice.startsWith("Running agents (")) {
       await showRunningAgents(ctx);
       await showAgentsMenu(ctx);
+    } else if (choice.startsWith("Resumable sessions (")) {
+      await showResumableSessions(ctx);
+      await showAgentsMenu(ctx);
     } else if (choice.startsWith("Agent types (")) {
       await showAllAgentsList(ctx);
       await showAgentsMenu(ctx);
@@ -1547,6 +1582,75 @@ Terse command-style prompts produce shallow, generic work.
       await showSettings(ctx);
       await showAgentsMenu(ctx);
     }
+  }
+
+  /** Read a file's mtime (ms since epoch), or undefined if unavailable. */
+  function fileMtime(path: string): number | undefined {
+    try {
+      return statSync(path).mtimeMs;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Compact relative-time label: "just now", "5m ago", "3h ago", "2d ago",
+   *  or a YYYY-MM-DD date for older entries. */
+  function formatRelativeTime(ms: number | undefined): string {
+    if (ms == null) return "saved";
+    const sec = Math.round((Date.now() - ms) / 1000);
+    if (sec < 60) return "just now";
+    if (sec < 3600) return `${Math.floor(sec / 60)}m ago`;
+    if (sec < 86400) return `${Math.floor(sec / 3600)}h ago`;
+    if (sec < 86400 * 7) return `${Math.floor(sec / 86400)}d ago`;
+    return new Date(ms).toISOString().slice(0, 10);
+  }
+
+  /** List disk-persisted subagent sessions and resume a chosen one with a new
+   *  prompt. The resumed agent is promoted out of the resumable registry and
+   *  surfaces as a live record (Running agents) for the duration of the run. */
+  async function showResumableSessions(ctx: ExtensionCommandContext) {
+    const entries = manager.listResumable();
+    if (entries.length === 0) {
+      ctx.ui.notify("No resumable sessions found.", "info");
+      return;
+    }
+
+    // Newest-first by mtime so recently-active sessions surface on top.
+    const ranked = entries
+      .map((e) => ({ e, m: fileMtime(e.sessionFilePath) ?? 0 }))
+      .sort((a, b) => b.m - a.m);
+    const options = ranked.map(({ e, m }) =>
+      `${getDisplayName(e.metadata.type)} · ${e.description} · ${formatRelativeTime(m)}`,
+    );
+
+    const choice = await ctx.ui.select("Resume a persisted session", options);
+    if (!choice) return;
+    const idx = options.indexOf(choice);
+    if (idx < 0) return;
+    const entry = ranked[idx].e;
+
+    const prompt = await ctx.ui.input("Message to resume with", "");
+    if (!prompt?.trim()) {
+      ctx.ui.notify("Resume cancelled.", "info");
+      return;
+    }
+
+    let record: AgentRecord | undefined;
+    try {
+      record = await manager.resumeFromDisk(entry.sessionFilePath, prompt, { ctx, pi });
+    } catch (err) {
+      ctx.ui.notify(`Resume failed: ${err instanceof Error ? err.message : String(err)}`, "warning");
+      return;
+    }
+    if (!record) {
+      ctx.ui.notify("Could not resume that session (no metadata on disk).", "warning");
+      return;
+    }
+    if (record.status === "error") {
+      ctx.ui.notify(`Resume failed: ${record.error}`, "warning");
+      return;
+    }
+    ctx.ui.notify(`Resumed "${entry.description}".`, "info");
   }
 
   async function showAllAgentsList(ctx: ExtensionCommandContext) {
