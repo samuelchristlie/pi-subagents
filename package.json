@@ -23,10 +23,10 @@
   "peerDependencies": {
     "@earendil-works/pi-ai": ">=0.74.0",
     "@earendil-works/pi-coding-agent": ">=0.74.0",
-    "@earendil-works/pi-tui": ">=0.74.0"
+    "@earendil-works/pi-tui": ">=0.74.0",
+    "@sinclair/typebox": "*"
   },
   "dependencies": {
-    "@sinclair/typebox": "^0.34.49",
     "croner": "^10.0.1",
     "nanoid": "^5.0.0"
   },
